@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Welcome Page</title>
+    <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+
+    <link rel="manifest" href="/static/site.webmanifest">
+    <link rel="icon" href="static/favicon.ico" />
+    <link rel="favicon-16x16" href="static/favicon-16x16.png" sizes="16x16" />
+    <link rel="favicon-32x32" href="static/favicon-32x32.png" sizes="32x32" />
+    <link rel="apple-touch-icon" href="static/apple-touch-icon.png" />
+    <link rel="android-chrome-192x192" href="static/android-chrome-192x192.png" sizes="192x192" />
+    <link rel="android-chrome-512x512" href="static/android-chrome-512x512.png" sizes="512x512" />
+
+</head>
+<body style="color:white; background-image: url('/static/images/robot-working-as-librarian-instead-humans.jpg'); background-repeat:repeat-y; background-size:cover; font-family: 'Gill Sans', 'Gill Sans MT', Calibri, 'Trebuchet MS', sans-serif; height: 100vh;">
+
+    <nav class="navbar bg-body-tertiary py-5">
+      <div class="container-fluid justify-content-center">
+        <a class="navbar-brand" href="https://www.ixengineers.com/">
+          <img src="{{ url_for('static', filename='images/iXLogo.png') }}" alt="Logo" width="200" height="80" class="d-inline-block align-text-top bg-transparent mt-10">
+        </a>
+      </div>
+    </nav>
+
+    <div class="container-fluid px-4 py-5" style="height: 75vh;">
+        <div class="align-items-center g-lg-5 py-5">
+          <div class="text-center">
+            <h1 class="display-1 lh-1 mb-3">Hi, I'm <span class="fw-bold" style="color: #7eb338;">"iXPlore!"</span></h1>
+            <h2 class="display-4 fw-light lh-1 mb-3">Your <span style="color: #9f1e22;">A</span><span style="color: #6a6b6c;">I</span> assistant</h2>
+            <p class="mt-4" style="color:#d4d4d3; font-weight: lighter; font-size:xx-large;">I’m your partner in exploring, summarizing, and uncovering answers from documents in a distinctive and impactful way.</p>
+
+            <p class="d-inline-flex gap-1">
+              <a href="{{url_for('welcome')}}" class="btn active hover btn-lg mt-4" role="button" data-bs-toggle="button" aria-pressed="true" style="color:#7eb338; border-color: #7eb338;">Sign-in</a>
+            </p>
+          </div>
+        </div>
+
+    </div>
+</body>
+</html>
