@@ -11,7 +11,6 @@ from openai import OpenAI
 import requests
 from PyPDF2 import PdfReader, PdfMerger
 from pdf2image import convert_from_path
-import pytesseract
 from dotenv import load_dotenv
 from flask_migrate import Migrate
 from extensions import db
@@ -65,7 +64,7 @@ import tiktoken
 load_dotenv()  # Load environment variables from .env file
 
 # ---- Tesseract location (Windows) ----
-tcmd = os.getenv("TESSERACT_CMD", "").strip()
+tcmd = "/usr/bin/tesseract"
 if tcmd:
     pytesseract.pytesseract.tesseract_cmd = tcmd
     print("[TESSERACT] cmd =", pytesseract.pytesseract.tesseract_cmd)
