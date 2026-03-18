@@ -3243,150 +3243,315 @@ def call_openai_with_web_search(
     return text, data
 
 
+# ===================== DUE DILIGENCE (PRODUCTION-SAFE) =====================
+
+DD_MAX_PHASE1_QUERIES = 5
+DD_MAX_PHASE2_QUERIES = 6
+DD_PER_RESULT_CHAR_LIMIT = 700
+DD_EVIDENCE_SECTION_LIMIT = 8_000
+
+
+def _norm_text(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
+
+
+def _truncate_text(s: str, limit: int) -> str:
+    s = _norm_text(s)
+    if len(s) <= limit:
+        return s
+    return s[:limit].rstrip() + "..."
+
+
+def _dedupe_strings(items: list[str]) -> list[str]:
+    seen = set()
+    out = []
+    for x in items:
+        key = _norm_text(x).lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(x)
+    return out
+
+
+def _compact_people(people: list[dict]) -> list[dict]:
+    out = []
+    for p in (people or []):
+        name = (p.get("name") or "").strip()
+        role = (p.get("role") or "").strip()
+        if name:
+            out.append({"name": name, "role": role})
+    return out
+
+
 def _dd_queries_phase1_identity(company: str, jurisdiction: str, industry: str, people: list[dict]) -> list[str]:
-    q = []
-    # Company identity / basics
-    q += [
+    """
+    Keep only the highest-value identity/role confirmation searches.
+    """
+    queries = [
         f'{company} official website',
         f'{company} leadership team directors',
-        f'{company} "About us" {jurisdiction}'.strip(),
+        f'{company} "{jurisdiction}" company profile' if jurisdiction else f'{company} company profile',
     ]
-    if industry:
-        q.append(f'{company} {industry} profile')
 
-    # People identity / role confirmation
-    for p in (people or []):
+    if industry:
+        queries.append(f'{company} {industry} company profile')
+
+    for p in (people or [])[:2]:
         name = (p.get("name") or "").strip()
         role = (p.get("role") or "").strip()
         if not name:
             continue
-        q += [
+        queries.extend([
             f'"{name}" "{company}" {role}'.strip(),
             f'"{name}" LinkedIn "{company}"'.strip(),
-            f'"{name}" "{company}" profile'.strip(),
-        ]
-    return list(dict.fromkeys([x for x in q if x]))
+        ])
+
+    return _dedupe_strings([q for q in queries if q])[:DD_MAX_PHASE1_QUERIES]
 
 
 def _dd_queries_phase2_risk(company: str, jurisdiction: str, people: list[dict]) -> list[str]:
-    # Company risk
-    q = [
-        f'"{company}" sanctions',
-        f'"{company}" debarred OR blacklist OR procurement ban',
-        f'"{company}" fraud OR corruption OR bribery OR "money laundering"',
-        f'"{company}" regulator warning OR enforcement OR fine',
+    """
+    Focus on the most decision-relevant risk lenses.
+    """
+    queries = [
+        f'"{company}" sanctions OR debarred OR blacklist',
+        f'"{company}" fraud OR corruption OR bribery',
+        f'"{company}" regulator enforcement OR fine OR warning',
         f'"{company}" lawsuit OR litigation OR court case',
-        f'"{company}" insolvency OR liquidation OR business rescue',
     ]
-    if jurisdiction:
-        q.append(f'"{company}" {jurisdiction} regulator enforcement')
 
-    # Individual risk
-    for p in (people or []):
+    if jurisdiction:
+        queries.append(f'"{company}" {jurisdiction} insolvency OR liquidation OR business rescue')
+
+    for p in (people or [])[:2]:
         name = (p.get("name") or "").strip()
         if not name:
             continue
-        q += [
+        queries.extend([
             f'"{name}" sanctions OR debarred OR disqualified',
-            f'"{name}" fraud OR corruption OR bribery OR "money laundering"',
-            f'"{name}" investigation OR charged OR convicted',
-            f'"{name}" PEP OR "politically exposed"',
-            f'"{name}" lawsuit OR court case',
-        ]
-    return list(dict.fromkeys([x for x in q if x]))
+            f'"{name}" fraud OR corruption OR bribery OR investigation',
+        ])
+
+    return _dedupe_strings([q for q in queries if q])[:DD_MAX_PHASE2_QUERIES]
 
 
 def _dd_identity_badge_from_evidence(company_hits: int, people_hits: dict) -> tuple[str, str]:
-    """
-    Very simple and defensible scoring:
-    - Confirmed: company has >=2 strong identity hits and >=1 hit for each person (or person list empty)
-    - Limited: some hits but incomplete
-    - Unverified: basically no identity hits
-    """
     people = list(people_hits.keys())
+
     if company_hits >= 2 and (not people or all(people_hits.get(n, 0) >= 1 for n in people)):
-        return "Identity confirmed", "Company and individuals have corroborating public identity/role signals."
+        return "Identity confirmed", "Company and named individuals have corroborating public identity or role signals."
+
     if company_hits >= 1 or any(v >= 1 for v in people_hits.values()):
-        return "Limited public information", "Some public identity signals found, but coverage is incomplete or thin."
-    return "Unverified", "Insufficient reliable public information to confirm identity/roles."
+        return "Limited public information", "Some public identity signals were found, but coverage is incomplete."
+
+    return "Unverified", "Insufficient reliable public information was found to confirm identity and roles confidently."
 
 
-def _dd_build_synthesis_prompt(system_prompt: str, inputs: dict, evidence: dict) -> str:
-    # Keep this compact and structured — the model will write the report using evidence only.
+def _dd_search_summary_prompt(phase: str, query: str) -> str:
+    if phase == "identity":
+        return (
+            "PHASE 1 (IDENTITY). Use web_search if helpful.\n"
+            "Goal: confirm company existence, role alignment, and identity only.\n"
+            f"Query: {query}\n\n"
+            "Return 3-5 concise bullets.\n"
+            "Each bullet must include: source, date if visible, and exactly what was confirmed.\n"
+            "Note any ambiguity or uncertainty in names or roles.\n"
+            "If nothing reliable is found, say exactly: No reliable public information found."
+        )
+
     return (
-        system_prompt.strip()
-        + "\n\nINPUTS:\n"
-        + json.dumps(inputs, ensure_ascii=False, indent=2)
-        + "\n\nEVIDENCE (PUBLIC SEARCH RESULTS, SUMMARIZED):\n"
-        + json.dumps(evidence, ensure_ascii=False, indent=2)
-        + "\n\nWRITE THE REPORT NOW using the exact required format."
+        "PHASE 2 (RISK). Use web_search if helpful.\n"
+        "Goal: find credible adverse public information relevant to sanctions, debarment, enforcement, litigation, fraud, corruption, insolvency, or reputational risk.\n"
+        f"Query: {query}\n\n"
+        "Return up to 5 concise bullets.\n"
+        "Each bullet must include: source, date if visible, what happened, and why it may matter.\n"
+        "If the result may relate to someone else with the same or similar name, say so explicitly.\n"
+        "If nothing reliable is found, say exactly: No reliable adverse public information found."
     )
 
+def _dd_run_search_batch(search_model: str, queries: list[str], phase: str) -> tuple[list[dict], int, dict]:
+    """
+    Returns:
+      results: [{"query": ..., "summary": ...}, ...]
+      hit_count: simple positive-hit counter
+      people_hits: only used in identity phase, else empty dict
+    """
+    results = []
+    hit_count = 0
+    people_hits = {}
 
-# Drop-in system prompt (from your earlier requirement)
+    for q in queries:
+        try:
+            txt, _ = call_openai_with_web_search(
+                model=search_model,
+                prompt=_dd_search_summary_prompt(phase, q),
+                max_output_tokens=350,
+                timeout_read=75,
+                web_search_context_size="medium" if phase == "identity" else "high",
+            )
+            cleaned = _truncate_text(txt or "", DD_PER_RESULT_CHAR_LIMIT)
+
+            if not cleaned:
+                cleaned = "No reliable public information found." if phase == "identity" else "No reliable adverse public information found."
+
+            results.append({
+                "query": q,
+                "summary": cleaned
+            })
+
+            negative_marker = (
+                "No reliable public information found."
+                if phase == "identity"
+                else "No reliable adverse public information found."
+            )
+
+            if negative_marker not in cleaned and len(cleaned) > 40:
+                hit_count += 1
+
+        except Exception as e:
+            results.append({
+                "query": q,
+                "summary": f"Search failed or timed out for this query: {str(e)}"
+            })
+
+    return results, hit_count, people_hits
+
+
+def _dd_trim_evidence(evidence_items: list[dict], max_chars: int) -> list[dict]:
+    """
+    Trims total evidence volume so the synthesis prompt stays bounded.
+    """
+    out = []
+    used = 0
+    for item in evidence_items:
+        q = _truncate_text(item.get("query", ""), 180)
+        s = _truncate_text(item.get("summary", ""), DD_PER_RESULT_CHAR_LIMIT)
+        block_len = len(q) + len(s)
+        if used + block_len > max_chars:
+            break
+        out.append({"query": q, "summary": s})
+        used += block_len
+    return out
+
+
+def _dd_build_synthesis_prompt(inputs_obj: dict, evidence: dict, badge: str, badge_reason: str) -> str:
+    return (
+        DUE_DILIGENCE_SYSTEM_PROMPT
+        + "\n\nINPUTS:\n"
+        + json.dumps(inputs_obj, ensure_ascii=False, indent=2)
+        + "\n\nIDENTITY BADGE:\n"
+        + json.dumps({
+            "badge": badge,
+            "rationale": badge_reason
+        }, ensure_ascii=False, indent=2)
+        + "\n\nEVIDENCE (PUBLIC SEARCH RESULTS, SUMMARISED):\n"
+        + json.dumps(evidence, ensure_ascii=False, indent=2)
+        + "\n\nTASK:\n"
+        + "Write the final due diligence report now.\n"
+        + "Base it only on the supplied evidence.\n"
+        + "Be specific, practical, and decision-useful.\n"
+        + "Where evidence is limited, explain the limitation instead of giving a blank answer.\n"
+        + "Where identity is ambiguous, say so explicitly.\n"
+        + "Where adverse information appears material, explain why.\n"
+    )
+
 DUE_DILIGENCE_SYSTEM_PROMPT = """
-You are an AI assistant supporting iX’s Bid and Tender due diligence process.
+You are an AI assistant supporting iX's bid and tender due diligence process.
 
-GOAL
-Conduct a high-level, public-information due diligence assessment of:
+PURPOSE
+Conduct a concise, decision-useful public-information due diligence assessment of:
 1) the customer company, and
 2) the named key individuals involved in the deal.
 
-Your purpose is to identify potential red flags relevant to fraud, corruption, sanctions, ethics, or major reputational risk.
-You are NOT providing legal, compliance, or financial advice.
-You are highlighting public signals for human review.
+Your role is to identify potential red flags relevant to fraud, corruption, sanctions, ethics, litigation, regulatory exposure, reputational risk, and identity uncertainty.
+You are NOT providing legal, compliance, financial, or investigative advice.
+You are producing a public-information screening to support human decision-making.
 
-IMPORTANT PRINCIPLES
-- Use ONLY lawful, publicly available information.
-- Do NOT claim access to confidential, paid, private, or internal databases.
-- Do NOT speculate or infer wrongdoing from absence of information.
+CORE PRINCIPLES
+- Use ONLY the evidence provided to you.
+- Do NOT invent facts, sources, or certainty.
+- Do NOT speculate or imply wrongdoing where evidence is weak or absent.
 - Clearly distinguish between:
-  - Confirmed facts,
-  - Credible allegations (with sources),
-  - Unverified or speculative claims (generally exclude these).
+  - confirmed facts,
+  - credible adverse signals,
+  - limited public information,
+  - identity ambiguity.
+- Do NOT say "information not available" unless absolutely necessary.
+  Where evidence is limited, explain what was found, what remains unclear, and why that matters.
+- Prioritise risk signals, inconsistencies, and identity confidence over generic company descriptions.
 
-SOURCE PRIORITY (CRITICAL)
-You must assess information in TWO PHASES:
+SOURCE INTERPRETATION RULES
+- Treat official websites, public registries, regulator notices, court records, and reputable news as strongest signals.
+- Treat LinkedIn and public profile pages as identity-supporting, not conclusive on their own.
+- If a name may refer to multiple people, explicitly state the ambiguity.
+- If adverse information appears to relate to someone else with a similar name, say so clearly.
+- Lack of adverse information is NOT proof of low risk; describe it as "no reliable adverse public information identified."
 
-PHASE 1 — Identity & Role Confirmation (LOW RISK)
-Permitted sources include:
-- The company’s official website (About, Leadership, Directors, Media pages),
-- Public professional profiles (e.g., LinkedIn),
-- Public company registries and press releases.
+OUTPUT STYLE
+- Write in clear business English for a non-technical executive audience.
+- Be concise, analytical, and practical.
+- Avoid overly legalistic or academic wording.
+- Use short paragraphs and bullet points where helpful.
+- Focus on what matters for a bid/no-bid or approval discussion.
 
-This phase is used ONLY to:
-- Confirm identity,
-- Confirm role, seniority, and professional background,
-- Establish whether the individual plausibly exists in the stated capacity.
-
-Absence of adverse information in Phase 1 MUST NOT be treated as a red flag.
-
-PHASE 2 — Risk & Adverse Signals (HIGHER SCRUTINY)
-Permitted sources include:
-- Reputable news outlets,
-- Regulator announcements,
-- Court judgments,
-- Sanctions and watchlists,
-- Enforcement or debarment lists,
-- Public ESG or labour findings.
-
-Only this phase may be used to identify red flags.
-
-CONFIDENCE & LIMITATIONS
-- If information is limited, state this explicitly.
-- If no adverse information is found, say so clearly.
-- Do NOT imply that lack of data equals risk.
-
-OUTPUT REQUIREMENTS
-Structure the response EXACTLY as follows:
+REQUIRED OUTPUT STRUCTURE
 
 1. Summary Assessment
-2. Customer Company — 10 Due Diligence Questions
-3. Key Individuals — 10 Due Diligence Questions per Person
-4. Confidence Badge (Identity confidence level)
+Provide:
+- a short overall assessment of the company and named individuals,
+- the most important positive and negative signals,
+- a practical view of whether anything requires escalation or monitoring.
 
-Always include:
-“This is not legal or compliance advice; it is a public-information screening to support human decision-making.”
+2. Customer Company — 10 Due Diligence Questions
+Answer these exact questions:
+
+1. What evidence confirms the company's identity, legal existence, and operating profile?
+2. What does public information indicate about the company's business activities and footprint?
+3. Who are the visible directors, executives, or ownership-related persons in public sources?
+4. Are there sanctions, debarment, blacklist, or regulatory warning signals linked to the company?
+5. Is there evidence of litigation, enforcement, or court-related disputes involving the company?
+6. Are there adverse media or reputational concerns linked to the company?
+7. Are there inconsistencies, ambiguities, or gaps in the company's public identity profile?
+8. Are there any public indicators of financial distress, insolvency, liquidation, or business rescue?
+9. Are there links to politically exposed persons, state influence, or high-risk jurisdictions?
+10. What overall risk indicators emerge for the company from the available evidence?
+
+3. Key Individuals — 10 Due Diligence Questions per Person
+For EACH named individual, answer these exact questions:
+
+1. Can the individual's identity be reasonably confirmed from public sources?
+2. What is the individual's apparent role or relationship to the company?
+3. What does public information show about their professional background?
+4. Are they linked to other companies, directorships, or business interests?
+5. Are there sanctions, disqualifications, or regulatory concerns linked to this person?
+6. Is there evidence of litigation, investigations, enforcement, or criminal allegations involving this person?
+7. Are there adverse media or reputational concerns linked to this person?
+8. Are there ambiguities or risks of mistaken identity associated with this person's name?
+9. Are there links to politically exposed persons, public office, or high-risk jurisdictions?
+10. What overall risk indicators emerge for this individual from the available evidence?
+
+4. Confidence Badge (Identity confidence level)
+Choose ONE of:
+- Identity confirmed
+- Limited public information
+- Unverified
+
+Then provide:
+- Badge:
+- Rationale:
+
+DECISION RULES
+- If identity is supported by multiple credible public signals, use "Identity confirmed."
+- If some signals exist but are incomplete or thin, use "Limited public information."
+- If identity cannot be reasonably tied to the stated person/company, use "Unverified."
+- If adverse findings exist, explain their relevance and materiality.
+- If adverse findings are weak, old, ambiguous, or may relate to another person, say so explicitly.
+- If no strong red flags are found, say so clearly, but do not overstate comfort.
+
+MANDATORY CLOSING SENTENCE
+Include this exact sentence once at the end:
+This is not legal or compliance advice; it is a public-information screening to support human decision-making.
 """.strip()
 
 @app.route("/due-diligence_page", methods=["GET"])
@@ -3398,114 +3563,107 @@ def due_diligence_page():
 @app.route("/due_diligence", methods=["POST"])
 def due_diligence():
     """
-    Two-phase public due diligence:
-    Phase 1: identity confirmation searches
-    Phase 2: risk/adverse searches
-    Then synthesize report + badge.
+    Production-safer due diligence flow:
+    - fewer searches
+    - smaller evidence
+    - lighter synthesis
+    - better Render stability
     """
     data = request.json or {}
+
     company = (data.get("company") or "").strip()
     jurisdiction = (data.get("jurisdiction") or "").strip()
     industry = (data.get("industry") or "").strip()
-    people = data.get("people") or []
+    people = _compact_people(data.get("people") or [])
 
     if not company:
         return jsonify({"message": "Customer company name is required."}), 400
 
-    # ---- Models ----
     search_model = os.getenv("OPENAI_DD_SEARCH_MODEL", "gpt-4o-mini")
-    analysis_model = os.getenv("OPENAI_DD_ANALYSIS_MODEL", "gpt-5-pro")
+    analysis_model = os.getenv("OPENAI_DD_ANALYSIS_MODEL", "gpt-4o-mini")
 
-    # ---- Phase 1: Identity ----
-    phase1_queries = _dd_queries_phase1_identity(company, jurisdiction, industry, people)
-
-    # We’ll store a compact, UI-friendly evidence object
-    evidence = {
-        "inputs": {"company": company, "jurisdiction": jurisdiction, "industry": industry, "people": people},
-        "phase1_identity": [],
-        "phase2_risk": [],
+    inputs_obj = {
+        "CustomerCompanyName": company,
+        "Jurisdiction": jurisdiction or "Not specified",
+        "Industry": industry or "Not specified",
+        "KeyIndividuals": people,
     }
 
-    # Track “hits” counts for the badge (simple signal: non-empty summaries)
-    company_identity_hits = 0
-    people_identity_hits = { (p.get("name") or "").strip(): 0 for p in people if (p.get("name") or "").strip() }
-
     try:
-        for q in phase1_queries[:12]:  # cap for cost/time
-            prompt = (
-                "PHASE 1 (IDENTITY). Use web_search if helpful.\n"
-                "Goal: find public info confirming identity/role only.\n"
-                f"Query: {q}\n\n"
-                "Return 3–6 bullet findings, each with: source name + date (if visible) + what it confirms.\n"
-                "If nothing reliable is found, say: 'No reliable public information found.'"
-            )
-            txt, raw = call_openai_with_web_search(
-                model=search_model,
-                prompt=prompt,
-                max_output_tokens=400,
-                timeout_read=90,
-                web_search_context_size="medium",
-            )
+        # -----------------------------
+        # Phase 1: Identity
+        # -----------------------------
+        phase1_queries = _dd_queries_phase1_identity(company, jurisdiction, industry, people)
+        phase1_results, company_identity_hits, _ = _dd_run_search_batch(
+            search_model=search_model,
+            queries=phase1_queries,
+            phase="identity"
+        )
 
-            item = {"query": q, "summary": txt[:2000]}
-            evidence["phase1_identity"].append(item)
-
-            # crude hit counting (good enough for badge)
-            if "No reliable public information found" not in (txt or "") and len((txt or "").strip()) > 40:
-                if company.lower() in q.lower():
-                    company_identity_hits += 1
-                for person_name in list(people_identity_hits.keys()):
-                    if person_name.lower() in q.lower():
-                        people_identity_hits[person_name] += 1
+        # basic per-person identity hit scan
+        people_identity_hits = {p["name"]: 0 for p in people}
+        for item in phase1_results:
+            ql = (item.get("query") or "").lower()
+            sl = (item.get("summary") or "").lower()
+            for p in people:
+                nm = p["name"].lower()
+                if nm in ql and "no reliable public information found" not in sl:
+                    people_identity_hits[p["name"]] += 1
 
         badge, badge_reason = _dd_identity_badge_from_evidence(company_identity_hits, people_identity_hits)
 
-        # ---- Phase 2: Risk ----
+        # -----------------------------
+        # Phase 2: Risk
+        # -----------------------------
         phase2_queries = _dd_queries_phase2_risk(company, jurisdiction, people)
+        phase2_results, _, _ = _dd_run_search_batch(
+            search_model=search_model,
+            queries=phase2_queries,
+            phase="risk"
+        )
 
-        for q in phase2_queries[:16]:  # cap
-            prompt = (
-                "PHASE 2 (RISK). Use web_search if helpful.\n"
-                "Goal: find credible adverse signals (sanctions, enforcement, corruption, fraud, debarment, serious litigation).\n"
-                f"Query: {q}\n\n"
-                "Return up to 6 bullets. Each bullet must include: (a) what happened, (b) date, (c) source.\n"
-                "If nothing reliable is found, say: 'No reliable adverse public information found.'"
-            )
-            txt, raw = call_openai_with_web_search(
-                model=search_model,
-                prompt=prompt,
-                max_output_tokens=450,
-                timeout_read=90,
-                web_search_context_size="high",
-            )
-            evidence["phase2_risk"].append({"query": q, "summary": txt[:2200]})
-
-        # ---- Synthesis (NO web tool; uses evidence only) ----
-        inputs_obj = {
-            "CustomerCompanyName": company,
-            "Jurisdiction": jurisdiction or "Not specified",
-            "Industry": industry or "Not specified",
-            "KeyIndividuals": people,
+        # -----------------------------
+        # Trim evidence before synthesis
+        # -----------------------------
+        evidence = {
+            "inputs": inputs_obj,
+            "phase1_identity": _dd_trim_evidence(phase1_results, DD_EVIDENCE_SECTION_LIMIT),
+            "phase2_risk": _dd_trim_evidence(phase2_results, DD_EVIDENCE_SECTION_LIMIT),
         }
 
-        synthesis_prompt = _dd_build_synthesis_prompt(DUE_DILIGENCE_SYSTEM_PROMPT, inputs_obj, evidence)
+        # -----------------------------
+        # Final synthesis
+        # -----------------------------
+        synthesis_prompt = _dd_build_synthesis_prompt(
+            inputs_obj=inputs_obj,
+            evidence=evidence,
+            badge=badge,
+            badge_reason=badge_reason
+        )
 
-        report_text, usage = call_openai_text(
+        report_text, _ = call_openai_text(
             model=analysis_model,
             prompt=synthesis_prompt,
             temperature=0.2,
-            max_output_tokens=5500,
-            timeout_read=480,
+            max_output_tokens=2200,
+            timeout_read=120,
         )
 
-        # Append badge section if the model didn’t include it cleanly
-        # (We still return badge separately for UI)
-        if "Confidence Badge" not in (report_text or ""):
-            report_text = (report_text or "").strip() + (
+        report_text = (report_text or "").strip()
+        if not report_text:
+            return jsonify({
+                "message": "Due diligence synthesis returned no output.",
+                "evidence": evidence,
+                "identity_badge": badge,
+                "identity_badge_reason": badge_reason,
+            }), 500
+
+        if "Confidence Badge" not in report_text:
+            report_text += (
                 f"\n\n4. Confidence Badge (Identity confidence level)\n"
                 f"- Badge: {badge}\n"
-                f"- Rationale: {badge_reason}\n"
-                f"- Note: This is not legal or compliance advice; it is a public-information screening to support human decision-making.\n"
+                f"- Rationale: {badge_reason}\n\n"
+                "This is not legal or compliance advice; it is a public-information screening to support human decision-making."
             )
 
         return jsonify({
@@ -3522,9 +3680,9 @@ def due_diligence():
     except Exception as e:
         print("[DUE_DILIGENCE] error:", e)
         return jsonify({
-            "message": "Due diligence failed (search or synthesis error).",
+            "message": "Due diligence failed.",
             "error": str(e)
         }), 500
-
+    
 if __name__ == '__main__':
     app.run(debug=True)

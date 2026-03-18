@@ -61,41 +61,6 @@
       border-top: 1px solid rgba(126, 179, 56, 0.8);
     }
 
-    /* Loader overlay */
-    .overlay {
-      display: none;
-      position: fixed;
-      inset: 0;
-      background: rgba(0,0,0,0.55);
-      z-index: 2000;
-      backdrop-filter: blur(2px);
-      align-items: center;
-      justify-content: center;
-      flex-direction: column;
-      text-align: center;
-      padding: 24px;
-    }
-
-    .spinner {
-      width: 64px;
-      height: 64px;
-      border-radius: 50%;
-      border: 6px solid rgba(255,255,255,0.25);
-      border-top-color: #7eb338;
-      animation: spin 1s linear infinite;
-      box-shadow: 0 0 0 6px rgba(214,32,45,0.12) inset;
-      margin-bottom: 14px;
-    }
-
-    @keyframes spin {
-      to { transform: rotate(360deg); }
-    }
-
-    .overlay small {
-      color: rgba(255,255,255,0.8);
-      max-width: 720px;
-    }
-
     #reportOutput {
       white-space: pre-wrap;
       background: rgba(255,255,255,0.92);
@@ -129,36 +94,146 @@
     }
 
     .badge-pill{
-        display:inline-flex;
-        align-items:center;
-        gap:8px;
-        padding:8px 12px;
-        border-radius:999px;
-        font-weight:800;
-        font-size:0.9rem;
-        line-height:1;
-        border:1px solid rgba(255,255,255,0.18);
+      display:inline-flex;
+      align-items:center;
+      gap:8px;
+      padding:8px 12px;
+      border-radius:999px;
+      font-weight:800;
+      font-size:0.9rem;
+      line-height:1;
+      border:1px solid rgba(255,255,255,0.18);
     }
     .badge-confirmed{ background: rgba(126,179,56,0.25); color:#d9ffd0; border-color: rgba(126,179,56,0.55); }
     .badge-limited  { background: rgba(255,193,7,0.18); color:#fff3cd; border-color: rgba(255,193,7,0.55); }
     .badge-unverified{ background: rgba(214,32,45,0.22); color:#ffd0d6; border-color: rgba(214,32,45,0.55); }
 
     .badge-dot{
-        width:10px; height:10px; border-radius:50%;
-        background: currentColor;
-        box-shadow: 0 0 0 3px rgba(255,255,255,0.08);
+      width:10px;
+      height:10px;
+      border-radius:50%;
+      background: currentColor;
+      box-shadow: 0 0 0 3px rgba(255,255,255,0.08);
     }
 
     .badge-reason{
-        margin-top:10px;
-        color: rgba(255,255,255,0.82);
-        font-size:0.92rem;
+      margin-top:10px;
+      color: rgba(255,255,255,0.82);
+      font-size:0.92rem;
+    }
+
+    .dd-disabled {
+      opacity: 0.65;
+      pointer-events: none;
+    }
+
+    /* Polished loader */
+    .loading-overlay{
+      position: fixed;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(0,0,0,0.55);
+      backdrop-filter: blur(6px);
+      z-index: 3000;
+      padding: 24px;
+    }
+
+    .d-none {
+      display: none !important;
+    }
+
+    .loading-card{
+      width: min(560px, 92vw);
+      background: rgba(20, 20, 20, 0.92);
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 18px;
+      padding: 22px 22px 18px 22px;
+      box-shadow: 0 18px 50px rgba(0,0,0,0.35);
+      text-align: left;
+      color: white;
+    }
+
+    .spinner-ring{
+      width: 52px;
+      height: 52px;
+      border-radius: 999px;
+      border: 6px solid rgba(255,255,255,0.18);
+      border-top-color: #7eb338;
+      border-right-color: #d6202d;
+      animation: ring-spin 0.9s linear infinite;
+      margin-bottom: 14px;
+    }
+
+    @keyframes ring-spin{
+      from { transform: rotate(0deg); }
+      to   { transform: rotate(360deg); }
+    }
+
+    .loading-title{
+      font-size: 18px;
+      font-weight: 700;
+      margin-bottom: 6px;
+      color: #ffffff;
+    }
+
+    .loading-sub{
+      font-size: 14px;
+      color: rgba(255,255,255,0.78);
+      line-height: 1.35;
+      margin-bottom: 12px;
+    }
+
+    .loading-meta{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-top: 6px;
+    }
+
+    .loading-meta .badge{
+      padding: 8px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+      color: #111;
+      background: #7eb338;
+    }
+
+    .loading-meta .elapsed{
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size: 12px;
+      color: rgba(255,255,255,0.78);
+    }
+
+    .loading-steps {
+      margin-top: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .step-item {
+      font-size: 13px;
+      color: rgba(255,255,255,0.55);
+      padding-left: 4px;
+      transition: all 0.25s ease;
+    }
+
+    .step-item.active {
+      color: #ffffff;
+      font-weight: 700;
+    }
+
+    .step-item.done {
+      color: #7eb338;
     }
   </style>
 </head>
 
 <body>
-  <!-- Header -->
   <header class="d-flex flex-wrap align-items-center justify-content-center justify-content-md-between py-3 px-3">
     <div class="text-start col-md-3 mb-2 mb-md-0">
       <a href="https://www.ixengineers.com/" class="align-items-center d-inline-flex text-decoration-none">
@@ -167,7 +242,7 @@
     </div>
 
     <div class="col-md-6 text-center">
-      <h3 class="m-0">BID Customer Company & SNR Person Due Diligence</h3>
+      <h3 class="m-0">BID Customer Company &amp; SNR Person Due Diligence</h3>
       <div class="mini-muted">Public-information screening to support human decision-making</div>
     </div>
 
@@ -180,21 +255,33 @@
 
   <div class="divider"></div>
 
-  <!-- Loader Overlay -->
-  <div id="overlay" class="overlay">
-    <div class="spinner"></div>
-    <h5 class="mb-2">Running public due diligence checks…</h5>
-    <small>
-      This may take a bit because it searches public sources and compiles a structured risk view.
-      Please don’t refresh the page.
-    </small>
+  <!-- Loading Overlay -->
+  <div id="loading-overlay" class="loading-overlay d-none" aria-live="polite" aria-busy="true">
+    <div class="loading-card">
+      <div class="spinner-ring" aria-hidden="true"></div>
+
+      <div class="loading-title" id="loading-title">Running due diligence…</div>
+      <div class="loading-sub" id="loading-sub">
+        Searching public sources and compiling a report.
+      </div>
+
+      <div class="loading-meta">
+        <span class="badge" id="loading-badge">In Progress</span>
+        <span class="elapsed" id="loading-elapsed">00:00</span>
+      </div>
+
+      <div class="loading-steps mt-3">
+        <div class="step-item" id="step-1">1. Confirming company and people identity</div>
+        <div class="step-item" id="step-2">2. Checking public risk indicators</div>
+        <div class="step-item" id="step-3">3. Preparing final due diligence report</div>
+      </div>
+    </div>
   </div>
 
   <main class="container pb-5">
     <div class="row g-4">
-      <!-- Inputs -->
       <div class="col-lg-5">
-        <div class="ix-card p-4">
+        <div class="ix-card p-4" id="due-diligence-form-wrap">
           <h5 class="ix-accent mb-3"><i class="bi bi-search"></i> Inputs</h5>
 
           <div class="mb-3">
@@ -214,7 +301,7 @@
 
           <div class="d-flex align-items-center justify-content-between mt-4 mb-2">
             <h6 class="m-0 ix-accent"><i class="bi bi-people"></i> Key individuals</h6>
-            <button class="btn btn-sm btn-ix-outline" onclick="addPersonRow()">
+            <button class="btn btn-sm btn-ix-outline" onclick="addPersonRow()" type="button">
               <i class="bi bi-plus-lg"></i> Add person
             </button>
           </div>
@@ -222,10 +309,10 @@
           <div id="peopleContainer" class="d-flex flex-column gap-2"></div>
 
           <div class="mt-4 d-grid gap-2">
-            <button class="btn btn-ix" onclick="runDueDiligence()">
+            <button class="btn btn-ix" id="run-dd-btn" onclick="runDueDiligence()" type="button">
               <i class="bi bi-shield-check"></i> Run Due Diligence
             </button>
-            <button class="btn btn-ix-outline" onclick="resetForm()">
+            <button class="btn btn-ix-outline" onclick="resetForm()" type="button">
               <i class="bi bi-arrow-counterclockwise"></i> Reset
             </button>
           </div>
@@ -237,13 +324,14 @@
         </div>
       </div>
 
-      <!-- Output -->
       <div class="col-lg-7">
         <div class="ix-card p-4">
           <h5 class="ix-accent mb-3"><i class="bi bi-file-earmark-text"></i> Report</h5>
+
           <div id="reportEmpty" class="mini-muted">
             No report yet. Fill in the details on the left and click <b>Run Due Diligence</b>.
           </div>
+
           <div id="identityBadgeWrap" style="display:none;" class="mt-2">
             <div id="identityBadge" class="badge-pill badge-limited">
               <span class="badge-dot" aria-hidden="true"></span>
@@ -251,7 +339,7 @@
             </div>
             <div id="identityBadgeReason" class="badge-reason"></div>
           </div>
-          
+
           <div id="reportOutput" class="mt-3" style="display:none;"></div>
 
           <details id="evidenceDetails" class="mt-3" style="display:none;">
@@ -260,10 +348,10 @@
           </details>
 
           <div class="mt-3 d-flex gap-2" id="downloadRow" style="display:none;">
-            <button class="btn btn-ix-outline" onclick="downloadReportTxt()">
+            <button class="btn btn-ix-outline" onclick="downloadReportTxt()" type="button">
               <i class="bi bi-download"></i> Download Report (.txt)
             </button>
-            <button class="btn btn-ix-outline" onclick="copyReport()">
+            <button class="btn btn-ix-outline" onclick="copyReport()" type="button">
               <i class="bi bi-clipboard"></i> Copy to Clipboard
             </button>
           </div>
@@ -278,9 +366,14 @@
     let lastReportText = "";
     let lastEvidenceObj = null;
 
-    function showOverlay(show) {
-      const overlay = document.getElementById("overlay");
-      overlay.style.display = show ? "flex" : "none";
+    let ddLoaderTimer = null;
+    let ddStageTimer = null;
+    let ddStartTime = null;
+
+    function escapeHtml(s) {
+      return (s || "").replace(/[&<>"']/g, (m) => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;"
+      }[m]));
     }
 
     function addPersonRow(name = "", role = "") {
@@ -305,6 +398,101 @@
       if (row) row.remove();
     }
 
+    function getPeople() {
+      const rows = document.querySelectorAll("#peopleContainer .people-row");
+      const people = [];
+      rows.forEach(r => {
+        const name = (r.querySelector(".person-name")?.value || "").trim();
+        const role = (r.querySelector(".person-role")?.value || "").trim();
+        if (name) people.push({ name, role });
+      });
+      return people;
+    }
+
+    function setDdFormEnabled(enabled) {
+      const formWrap = document.getElementById("due-diligence-form-wrap");
+      const submitBtn = document.getElementById("run-dd-btn");
+
+      if (formWrap) {
+        if (enabled) formWrap.classList.remove("dd-disabled");
+        else formWrap.classList.add("dd-disabled");
+      }
+
+      if (submitBtn) {
+        submitBtn.disabled = !enabled;
+      }
+    }
+
+    function setDdStep(stepNumber) {
+      const steps = [1, 2, 3];
+      steps.forEach(n => {
+        const el = document.getElementById(`step-${n}`);
+        if (!el) return;
+        el.classList.remove("active", "done");
+
+        if (n < stepNumber) el.classList.add("done");
+        else if (n === stepNumber) el.classList.add("active");
+      });
+    }
+
+    function showDdLoader() {
+      const overlay = document.getElementById("loading-overlay");
+      const titleEl = document.getElementById("loading-title");
+      const subEl = document.getElementById("loading-sub");
+      const badgeEl = document.getElementById("loading-badge");
+      const elapsedEl = document.getElementById("loading-elapsed");
+
+      titleEl.textContent = "Running due diligence…";
+      subEl.textContent = "Searching public sources and compiling a report.";
+      badgeEl.textContent = "In Progress";
+      elapsedEl.textContent = "00:00";
+
+      setDdStep(1);
+      overlay.classList.remove("d-none");
+
+      ddStartTime = Date.now();
+
+      if (ddLoaderTimer) clearInterval(ddLoaderTimer);
+      ddLoaderTimer = setInterval(() => {
+        const ms = Date.now() - ddStartTime;
+        const totalSec = Math.floor(ms / 1000);
+        const mm = String(Math.floor(totalSec / 60)).padStart(2, "0");
+        const ss = String(totalSec % 60).padStart(2, "0");
+        elapsedEl.textContent = `${mm}:${ss}`;
+      }, 250);
+
+      if (ddStageTimer) clearInterval(ddStageTimer);
+
+      let stage = 1;
+      ddStageTimer = setInterval(() => {
+        stage += 1;
+
+        if (stage === 2) {
+          setDdStep(2);
+          titleEl.textContent = "Checking risk indicators…";
+          subEl.textContent = "Reviewing sanctions, litigation, enforcement, and reputational signals.";
+        } else if (stage === 3) {
+          setDdStep(3);
+          titleEl.textContent = "Preparing final report…";
+          subEl.textContent = "Summarising findings into an executive-friendly due diligence report.";
+        } else {
+          clearInterval(ddStageTimer);
+        }
+      }, 12000);
+    }
+
+    function hideDdLoader() {
+      const overlay = document.getElementById("loading-overlay");
+      overlay.classList.add("d-none");
+
+      if (ddLoaderTimer) clearInterval(ddLoaderTimer);
+      if (ddStageTimer) clearInterval(ddStageTimer);
+
+      ddLoaderTimer = null;
+      ddStageTimer = null;
+      ddStartTime = null;
+    }
+
     function resetForm() {
       document.getElementById("company").value = "";
       document.getElementById("jurisdiction").value = "";
@@ -315,25 +503,10 @@
       document.getElementById("evidenceDetails").style.display = "none";
       document.getElementById("downloadRow").style.display = "none";
       document.getElementById("modelInfo").style.display = "none";
+      document.getElementById("identityBadgeWrap").style.display = "none";
       lastReportText = "";
       lastEvidenceObj = null;
-    }
-
-    function escapeHtml(s) {
-      return (s || "").replace(/[&<>"']/g, (m) => ({
-        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;"
-      }[m]));
-    }
-
-    function getPeople() {
-      const rows = document.querySelectorAll("#peopleContainer .people-row");
-      const people = [];
-      rows.forEach(r => {
-        const name = (r.querySelector(".person-name")?.value || "").trim();
-        const role = (r.querySelector(".person-role")?.value || "").trim();
-        if (name) people.push({ name, role });
-      });
-      return people;
+      addPersonRow();
     }
 
     async function runDueDiligence() {
@@ -347,7 +520,8 @@
         return;
       }
 
-      showOverlay(true);
+      setDdFormEnabled(false);
+      showDdLoader();
 
       try {
         const resp = await fetch("/due_diligence", {
@@ -356,11 +530,10 @@
           body: JSON.stringify({ company, jurisdiction, industry, people })
         });
 
-        const data = await resp.json();
+        const data = await resp.json().catch(() => ({}));
 
         if (!resp.ok) {
-          alert(data.message || "Due diligence failed.");
-          showOverlay(false);
+          alert(data.message || data.error || "Due diligence failed.");
           return;
         }
 
@@ -373,7 +546,6 @@
         out.style.display = "block";
         out.textContent = report || "(No report returned)";
 
-        // --- Confidence badge ---
         const badgeWrap = document.getElementById("identityBadgeWrap");
         const badgeEl = document.getElementById("identityBadge");
         const badgeTextEl = document.getElementById("identityBadgeText");
@@ -383,28 +555,26 @@
         const reason = (data.identity_badge_reason || "").trim();
 
         if (badge) {
-        badgeWrap.style.display = "block";
+          badgeWrap.style.display = "block";
 
-        badgeEl.classList.remove("badge-confirmed","badge-limited","badge-unverified");
+          badgeEl.classList.remove("badge-confirmed","badge-limited","badge-unverified");
 
-        if (badge.toLowerCase().includes("confirmed")) {
+          if (badge.toLowerCase().includes("confirmed")) {
             badgeEl.classList.add("badge-confirmed");
             badgeTextEl.textContent = "Identity: Confirmed";
-        } else if (badge.toLowerCase().includes("limited")) {
+          } else if (badge.toLowerCase().includes("limited")) {
             badgeEl.classList.add("badge-limited");
             badgeTextEl.textContent = "Identity: Limited";
-        } else {
+          } else {
             badgeEl.classList.add("badge-unverified");
             badgeTextEl.textContent = "Identity: Unverified";
-        }
+          }
 
-        badgeReasonEl.textContent = reason ? `Why: ${reason}` : "";
+          badgeReasonEl.textContent = reason ? `Why: ${reason}` : "";
         } else {
-        badgeWrap.style.display = "none";
+          badgeWrap.style.display = "none";
         }
 
-
-        // evidence block
         if (lastEvidenceObj) {
           document.getElementById("evidenceDetails").style.display = "block";
           document.getElementById("evidencePre").textContent = JSON.stringify(lastEvidenceObj, null, 2);
@@ -414,7 +584,6 @@
 
         document.getElementById("downloadRow").style.display = "flex";
 
-        // model info
         const mi = document.getElementById("modelInfo");
         if (data.models) {
           mi.style.display = "block";
@@ -427,7 +596,8 @@
         console.error(e);
         alert("Network / server error while running due diligence.");
       } finally {
-        showOverlay(false);
+        hideDdLoader();
+        setDdFormEnabled(true);
       }
     }
 
@@ -454,7 +624,6 @@
       }
     }
 
-    // Start with one person row by default
     addPersonRow();
   </script>
 
