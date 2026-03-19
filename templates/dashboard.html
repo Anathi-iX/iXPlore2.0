@@ -390,13 +390,17 @@
     loaderStart = null;
   }
 
-  let ocrEventSource = null;
+  let ocrPollTimer = null;
+
+  function stopOcrPolling() {
+    if (ocrPollTimer) {
+      clearInterval(ocrPollTimer);
+      ocrPollTimer = null;
+    }
+  }
 
   function startOcrProgress(progressUrl) {
-    if (ocrEventSource) {
-      ocrEventSource.close();
-      ocrEventSource = null;
-    }
+    stopOcrPolling();
 
     const box = document.getElementById("ocr-progress");
     const statusEl = document.getElementById("ocrStatus");
@@ -412,50 +416,71 @@
     docReady = false;
     setChatEnabled(false);
 
-    ocrEventSource = new EventSource(progressUrl);
+    async function pollOnce() {
+      try {
+        const res = await fetch(progressUrl, {
+          method: "GET",
+          cache: "no-store"
+        });
 
-    ocrEventSource.onmessage = (event) => {
-      const st = JSON.parse(event.data || "{}");
+        const st = await res.json().catch(() => ({}));
 
-      statusEl.textContent = st.message || st.status || "OCR running...";
+        if (!res.ok) {
+          statusEl.textContent = "OCR progress unavailable.";
+          document.getElementById('upload-message').textContent = "Could not read OCR progress.";
+          stopOcrPolling();
+          docReady = false;
+          setChatEnabled(false);
+          return;
+        }
 
-      if (st.total && st.total > 0) {
-        const pct = Math.round((st.done / st.total) * 100);
-        barEl.value = pct;
-        pctEl.textContent = pct + "%";
-      }
+        statusEl.textContent = st.message || st.status || "OCR running...";
 
-      if (st.status === "done") {
-        statusEl.textContent = "OCR complete. Document ready.";
-        document.getElementById('upload-message').textContent = "Document ready.";
+        if (st.total && st.total > 0) {
+          const pct = Math.round((st.done / st.total) * 100);
+          barEl.value = pct;
+          pctEl.textContent = pct + "%";
+        } else {
+          barEl.value = 0;
+          pctEl.textContent = "0%";
+        }
 
-        docReady = true;
-        setChatEnabled(true);
+        if (st.status === "done") {
+          statusEl.textContent = "OCR complete. Document ready.";
+          document.getElementById('upload-message').textContent = "Document ready.";
 
-        ocrEventSource.close();
-        ocrEventSource = null;
-        setTimeout(() => { box.style.display = "none"; }, 2500);
-      }
+          stopOcrPolling();
+          docReady = true;
+          setChatEnabled(true);
 
-      if (st.status === "error") {
-        statusEl.textContent = "OCR failed: " + (st.message || "");
-        document.getElementById('upload-message').textContent = "OCR failed. Please retry.";
+          setTimeout(() => {
+            box.style.display = "none";
+          }, 2500);
+          return;
+        }
 
+        if (st.status === "error" || st.status === "cancelled") {
+          statusEl.textContent = "OCR failed: " + (st.message || "");
+          document.getElementById('upload-message').textContent = "OCR failed. Please retry.";
+
+          stopOcrPolling();
+          docReady = false;
+          setChatEnabled(false);
+          return;
+        }
+
+      } catch (err) {
+        statusEl.textContent = "Lost connection while checking OCR progress.";
+        document.getElementById('upload-message').textContent = "Could not track OCR progress.";
+        stopOcrPolling();
         docReady = false;
         setChatEnabled(false);
-
-        ocrEventSource.close();
-        ocrEventSource = null;
       }
-    };
+    }
 
-    ocrEventSource.onerror = () => {
-      // if stream dies, leave UI disabled (safest) and stop spamming
-      if (ocrEventSource) {
-        ocrEventSource.close();
-        ocrEventSource = null;
-      }
-    };
+    // run immediately, then poll every 2.5 seconds
+    pollOnce();
+    ocrPollTimer = setInterval(pollOnce, 2500);
   }
 
   function updateUploadStatus() {

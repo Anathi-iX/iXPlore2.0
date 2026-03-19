@@ -34,7 +34,7 @@ from docx.oxml import OxmlElement
 from docx.enum.text import WD_BREAK
 from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-
+import shutil
 from PIL import Image, ImageOps, ImageFilter, ImageEnhance
 import numpy as np
 import io
@@ -73,6 +73,10 @@ if tcmd:
         print("[TESSERACT] version =", v)
     except Exception as e:
         print("[TESSERACT] ERROR:", e)
+
+print("[TESSERACT] env cmd =", os.getenv("TESSERACT_CMD"))
+print("[TESSERACT] which tesseract =", shutil.which("tesseract"))
+print("[TESSERACT] /usr/bin/tesseract exists =", os.path.exists("/usr/bin/tesseract"))
 
 # Microsoft 365 / Azure AD configuration
 client_id = os.getenv('MICROSOFT_CLIENT_ID')
@@ -2861,39 +2865,25 @@ def admin_feedback():
     feedback_list = Feedback.query.all()
     return render_template('admin_feedback.html', feedback_list=feedback_list)
 
-
-@app.route("/ocr_progress/<job_id>")
+@app.route("/ocr_progress/<job_id>", methods=["GET"])
 def ocr_progress(job_id):
-    def event_stream():
-        while True:
-            with OCR_JOBS_LOCK:
-                job = OCR_JOBS.get(job_id)
+    with OCR_JOBS_LOCK:
+        job = OCR_JOBS.get(job_id)
 
-            if not job:
-                yield f"event: error\ndata: {json.dumps({'message': 'job not found'})}\n\n"
-                return
+    if not job:
+        return jsonify({"message": "job not found"}), 404
 
-            payload = {
-                "status": job.get("status"),
-                "message": job.get("message", ""),
-                "done": job.get("done", 0),
-                "total": job.get("total", 0),
-                "page": job.get("page", 0),
-                "chars": job.get("chars", 0),
-                "last_conf": job.get("last_conf", None),
-                "filename": job.get("filename"),
-                "text_file": job.get("text_filepath", None),
-            }
-
-            yield f"data: {json.dumps(payload)}\n\n"
-
-            if payload["status"] in ("done", "error", "cancelled"):
-                return
-
-            time.sleep(0.8)
-
-    return Response(event_stream(), content_type="text/event-stream")
-
+    return jsonify({
+        "status": job.get("status"),
+        "message": job.get("message", ""),
+        "done": job.get("done", 0),
+        "total": job.get("total", 0),
+        "page": job.get("page", 0),
+        "chars": job.get("chars", 0),
+        "last_conf": job.get("last_conf"),
+        "filename": job.get("filename"),
+        "text_file": job.get("text_filepath")
+    })
 
 @app.route('/history')
 def history():

@@ -526,47 +526,66 @@
          * Waits for OCR to finish using the SSE endpoint returned by backend.
          * Updates the loader UI while waiting.
          */
-        async function waitForOcr(progressUrl) {
+         async function waitForOcr(progressUrl) {
+            if (!progressUrl) return;
+
+            showLoader("Running OCR…", "OCR", "Reading scanned pages (page-by-page).");
+
             return new Promise((resolve, reject) => {
-                if (!progressUrl) return resolve();
+                let stopped = false;
 
-                showLoader("Running OCR…", "OCR", "Reading scanned pages (page-by-page).");
+                async function poll() {
+                    if (stopped) return;
 
-                const source = new EventSource(progressUrl);
+                    try {
+                        const res = await fetch(progressUrl, {
+                            method: "GET",
+                            cache: "no-store"
+                        });
 
-                source.onmessage = (event) => {
-                const payload = JSON.parse(event.data);
+                        const payload = await res.json().catch(() => ({}));
 
-                // Update loader text with progress
-                const done = payload.done || 0;
-                const total = payload.total || 0;
-                const msg = payload.message || "OCR running…";
+                        if (!res.ok) {
+                            stopped = true;
+                            hideLoader();
+                            return reject(new Error("OCR progress unavailable"));
+                        }
 
-                document.getElementById("loading-title").textContent = `Running OCR… (${done}/${total || "?"})`;
-                document.getElementById("loading-badge").textContent = "OCR";
-                document.getElementById("loading-sub").textContent = msg;
+                        const done = payload.done || 0;
+                        const total = payload.total || 0;
+                        const msg = payload.message || "OCR running…";
 
-                if (payload.status === "done") {
-                    source.close();
-                    hideLoader();
-                    resolve();
+                        document.getElementById("loading-title").textContent =
+                            `Running OCR… (${done}/${total || "?"})`;
+                        document.getElementById("loading-badge").textContent = "OCR";
+                        document.getElementById("loading-sub").textContent = msg;
+
+                        if (payload.status === "done") {
+                            stopped = true;
+                            hideLoader();
+                            return resolve();
+                        }
+
+                        if (payload.status === "error" || payload.status === "cancelled") {
+                            stopped = true;
+                            hideLoader();
+                            return reject(new Error(payload.message || "OCR failed"));
+                        }
+
+                        // poll again after delay
+                        setTimeout(poll, 2500);
+
+                    } catch (err) {
+                        stopped = true;
+                        hideLoader();
+                        reject(new Error("Lost connection while checking OCR progress"));
+                    }
                 }
 
-                if (payload.status === "error" || payload.status === "cancelled") {
-                    source.close();
-                    hideLoader();
-                    reject(new Error(payload.message || "OCR failed"));
-                }
-                };
-
-                source.onerror = () => {
-                source.close();
-                hideLoader();
-                reject(new Error("OCR progress stream error"));
-                };
+                poll(); // start polling immediately
             });
         }
-      
+              
         async function runPredefined3(filename) {
             const questions = [
                 "What is the scope of works for this project?",
