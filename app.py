@@ -2302,7 +2302,7 @@ def run_ocr_job(job_id: str, pdf_path: str, text_filepath: str, filename: str):
         OCR_JOBS[job_id]["message"] = f"OCR failed: {e}"
 
 
-def _ocr_pdf_background(job_id: str, pdf_path: str, text_filepath: str, ocr_dpi: int = 300):
+def _ocr_pdf_background(job_id: str, pdf_path: str, text_filepath: str, ocr_dpi: int = 320):
     try:
         with OCR_JOBS_LOCK:
             OCR_JOBS[job_id]["status"] = "running"
@@ -2332,7 +2332,7 @@ def _ocr_pdf_background(job_id: str, pdf_path: str, text_filepath: str, ocr_dpi:
                 img = Image.open(io.BytesIO(pix.tobytes("png")))
 
                 candidates = []
-                for v in (0, 1, 2, 3):
+                for v in (0, 1):
                     pre_v = preprocess_for_ocr_variant(img, v)
                     t, c = ocr_page_best_effort(pre_v)
                     score = c + min(len(t) / 2500.0, 1.0) * 10.0
