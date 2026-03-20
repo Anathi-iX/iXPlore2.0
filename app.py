@@ -1021,6 +1021,21 @@ def _clean_ocr_text(s: str) -> str:
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
 
+def _cleanup_old_ocr_jobs(max_age_seconds: int = 3600):
+    now = time.time()
+    stale_ids = []
+
+    with OCR_JOBS_LOCK:
+        for job_id, job in OCR_JOBS.items():
+            completed_at = job.get("completed_at_ts")
+            status = job.get("status")
+
+            if status in ("done", "error", "cancelled") and completed_at:
+                if now - completed_at > max_age_seconds:
+                    stale_ids.append(job_id)
+
+        for job_id in stale_ids:
+            OCR_JOBS.pop(job_id, None)
 
 def _estimate_skew_angle_pil(gray_img: Image.Image) -> float:
     img = gray_img.copy()
@@ -2302,7 +2317,7 @@ def run_ocr_job(job_id: str, pdf_path: str, text_filepath: str, filename: str):
         OCR_JOBS[job_id]["message"] = f"OCR failed: {e}"
 
 
-def _ocr_pdf_background(job_id: str, pdf_path: str, text_filepath: str, ocr_dpi: int = 320):
+def _ocr_pdf_background(job_id: str, pdf_path: str, text_filepath: str, ocr_dpi: int = 220):
     try:
         with OCR_JOBS_LOCK:
             OCR_JOBS[job_id]["status"] = "running"
@@ -2357,17 +2372,24 @@ def _ocr_pdf_background(job_id: str, pdf_path: str, text_filepath: str, ocr_dpi:
                         pass
 
                 print(f"[OCR] job={job_id} page {i+1}/{total} chars={len(txt or '')} conf={conf:.1f}")
+                time.sleep(0.05)
 
         with OCR_JOBS_LOCK:
             OCR_JOBS[job_id]["status"] = "done"
             OCR_JOBS[job_id]["message"] = "OCR complete"
             OCR_JOBS[job_id]["completed_at"] = datetime.utcnow().isoformat()
+            OCR_JOBS[job_id]["completed_at_ts"] = time.time()
+
+        _cleanup_old_ocr_jobs()
 
     except Exception as e:
         print("[OCR] Background OCR error:", e)
         with OCR_JOBS_LOCK:
             OCR_JOBS[job_id]["status"] = "error"
             OCR_JOBS[job_id]["message"] = str(e)
+            OCR_JOBS[job_id]["completed_at_ts"] = time.time()
+
+        _cleanup_old_ocr_jobs()
 
 def find_snippets(text: str, query: str, window: int = 800, max_hits: int = 3):
     if not text or not query:
@@ -2881,8 +2903,7 @@ def ocr_progress(job_id):
         "page": job.get("page", 0),
         "chars": job.get("chars", 0),
         "last_conf": job.get("last_conf"),
-        "filename": job.get("filename"),
-        "text_file": job.get("text_filepath")
+        "filename": job.get("filename")
     })
 
 @app.route('/history')
