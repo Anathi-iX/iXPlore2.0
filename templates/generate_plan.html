@@ -255,12 +255,13 @@
   <script>
     // Initial filename if provided by server
     let filename = "{{ pdf_filename|e }}";
+    let ocrReady = !!filename;
 
     const $fileLabel = document.getElementById('fileLabel');
     const $drop = document.getElementById('dropZone');
     const $input = document.getElementById('fileInput');
-    const $chosen = document.getElementById('chosenFile');
 
+    const $chosen = document.getElementById('chosenFile');
     const $btn = document.getElementById('genBtn');
     const $status = document.getElementById('status');
     const $success = document.getElementById('successCard');
@@ -278,71 +279,117 @@
 
     function resetDownloadButtons() {
       $docxLink.href = "#";
-      $picPdfLink.classList.add("hidden"); $picPdfLink.href = "#";
-      $picPngLink.classList.add("hidden"); $picPngLink.href = "#";
+      $picPdfLink.classList.add("hidden");
+      $picPdfLink.href = "#";
+      $picPngLink.classList.add("hidden");
+      $picPngLink.href = "#";
       $picHint.classList.add("hidden");
-    }
-
-    // Enable button if we already have a filename from server
-    if (filename) {
-      $btn.disabled = false;
-      $fileLabel.innerHTML = `Using file: <span class="font-medium">${filename}</span>`;
-      $chosen.textContent = `Ready: ${filename}`;
-    }
-
-    async function uploadFile(file) {
-      const fd = new FormData();
-      fd.append('file', file);
-      const res = await fetch('/upload', { method: 'POST', body: fd });
-      if (!res.ok) throw new Error('Upload failed');
-      return res.json(); // { filenames: [...] }
-    }
-
-    async function prepareSingle(name, isScanned) {
-      const res = await fetch('/merge', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-          files: [name],
-          output_name: "",
-          is_scanned: !!isScanned
-        })
-      });
-      if (!res.ok) throw new Error('Failed to prepare file');
-      return res.json();
     }
 
     function setReady(name) {
       filename = name;
+      ocrReady = true;
       $chosen.textContent = `Ready: ${name}`;
       $fileLabel.innerHTML = `Using file: <span class="font-medium">${name}</span>`;
       $btn.disabled = false;
       $previewHint.textContent = "Click generate to produce outputs.";
     }
 
-    // Drag & drop behavior
-    ['dragenter','dragover'].forEach(evt => $drop.addEventListener(evt, e => {
-      e.preventDefault(); e.stopPropagation(); $drop.classList.add('dragover');
-    }));
-    ['dragleave','drop'].forEach(evt => $drop.addEventListener(evt, e => {
-      e.preventDefault(); e.stopPropagation(); $drop.classList.remove('dragover');
-    }));
-    $drop.addEventListener('drop', async (e) => {
-      const file = e.dataTransfer.files?.[0];
-      if (!file) return;
-      await handlePickedFile(file);
-    });
-    $input.addEventListener('change', async (e) => {
-      const file = e.target.files?.[0];
-      if (!file) return;
-      await handlePickedFile(file);
-    });
+    function setNotReady(name, msg) {
+      filename = name || "";
+      ocrReady = false;
+      $btn.disabled = true;
+      if (name) {
+        $fileLabel.innerHTML = `Using file: <span class="font-medium">${name}</span>`;
+      }
+      if (msg) {
+        $previewHint.textContent = msg;
+      }
+    }
+
+    async function uploadFile(file) {
+      const fd = new FormData();
+      fd.append("file", file);
+
+      const res = await fetch("/upload", {
+        method: "POST",
+        body: fd
+      });
+
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok) {
+        throw new Error(data.message || "Upload failed");
+      }
+
+      return data;
+    }
+
+    async function prepareSingle(name, isScanned) {
+      const res = await fetch("/merge", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          files: [name],
+          output_name: "",
+          is_scanned: !!isScanned
+        })
+      });
+
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok) {
+        throw new Error(data.message || "Failed to prepare file");
+      }
+
+      return data;
+    }
+
+    async function waitForOcrToFinish(progressUrl, fileName) {
+      let attempts = 0;
+      const maxAttempts = 900; // ~30 mins at 2s interval
+
+      while (attempts < maxAttempts) {
+        const res = await fetch(progressUrl, { cache: "no-store" });
+        const data = await res.json().catch(() => ({}));
+
+        if (!res.ok) {
+          throw new Error(data.message || "Could not read OCR progress.");
+        }
+
+        const done = Number(data.done || 0);
+        const total = Number(data.total || 0);
+        const status = data.status || "";
+        const msg = data.message || "OCR running...";
+
+        if (total > 0) {
+          $chosen.textContent = `OCR in progress for ${fileName}: page ${done}/${total}`;
+        } else {
+          $chosen.textContent = `OCR in progress for ${fileName}...`;
+        }
+
+        $previewHint.textContent = msg;
+
+        if (status === "done") {
+          return data;
+        }
+
+        if (status === "error" || status === "cancelled") {
+          throw new Error(data.message || "OCR failed.");
+        }
+
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        attempts += 1;
+      }
+
+      throw new Error("OCR timed out. Please try again.");
+    }
 
     async function handlePickedFile(file) {
       $chosen.textContent = `Uploading ${file.name}…`;
       $btn.disabled = true;
-      $success.classList.add('hidden');
-      $error.classList.add('hidden');
+      $success.classList.add("hidden");
+      $error.classList.add("hidden");
       resetDownloadButtons();
       $json.textContent = "";
       $previewHint.textContent = "Preparing document…";
@@ -350,26 +397,99 @@
       try {
         const up = await uploadFile(file);
         const name = up.filenames?.[0];
-        if (!name) throw new Error('No filename returned');
 
-        $chosen.textContent = `Extracting text from ${name}…`;
-        await prepareSingle(name, $isScanned.checked);
-        setReady(name);
+        if (!name) {
+          throw new Error("No filename returned");
+        }
+
+        setNotReady(name, "Preparing document…");
+
+        $chosen.textContent = $isScanned.checked
+          ? `Starting OCR for ${name}…`
+          : `Extracting embedded text from ${name}…`;
+
+        const prep = await prepareSingle(name, $isScanned.checked);
+
+        if (!prep.ocr || prep.ocr.status === "skipped" || prep.ocr.status === "done") {
+          setReady(name);
+          return;
+        }
+
+        if (prep.ocr.status === "queued" || prep.ocr.status === "running") {
+          if (!prep.ocr.progress_url) {
+            throw new Error("OCR started but no progress URL was returned.");
+          }
+
+          setNotReady(name, "Reading scanned pages. Please wait…");
+          await waitForOcrToFinish(prep.ocr.progress_url, name);
+          setReady(name);
+          return;
+        }
+
+        throw new Error("Unexpected OCR preparation state.");
       } catch (err) {
-        $chosen.textContent = '';
+        filename = "";
+        ocrReady = false;
+        $btn.disabled = true;
+        $chosen.textContent = "";
         $previewHint.textContent = "Upload failed.";
-        $errorMsg.textContent = err.message || 'Upload error';
-        $error.classList.remove('hidden');
+        $errorMsg.textContent = err.message || "Upload error";
+        $error.classList.remove("hidden");
       }
     }
 
-    // Generate button (no Preferences)
-    $btn.addEventListener('click', async () => {
-      if (!filename) return;
+    // Existing filename from server
+    if (filename) {
+      ocrReady = true;
+      $btn.disabled = false;
+      $fileLabel.innerHTML = `Using file: <span class="font-medium">${filename}</span>`;
+      $chosen.textContent = `Ready: ${filename}`;
+      $previewHint.textContent = "Click generate to produce outputs.";
+    } else {
+      ocrReady = false;
+      $btn.disabled = true;
+    }
 
-      $success.classList.add('hidden');
-      $error.classList.add('hidden');
-      $status.classList.remove('hidden');
+    // Drag & drop
+    ["dragenter", "dragover"].forEach(evt => {
+      $drop.addEventListener(evt, e => {
+        e.preventDefault();
+        e.stopPropagation();
+        $drop.classList.add("dragover");
+      });
+    });
+
+    ["dragleave", "drop"].forEach(evt => {
+      $drop.addEventListener(evt, e => {
+        e.preventDefault();
+        e.stopPropagation();
+        $drop.classList.remove("dragover");
+      });
+    });
+
+    $drop.addEventListener("drop", async (e) => {
+      const file = e.dataTransfer.files?.[0];
+      if (!file) return;
+      await handlePickedFile(file);
+    });
+
+    $input.addEventListener("change", async (e) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+      await handlePickedFile(file);
+    });
+
+    // Generate button
+    $btn.addEventListener("click", async () => {
+      if (!filename || !ocrReady) {
+        $errorMsg.textContent = "Document is not ready yet. If OCR is enabled, please wait for it to finish.";
+        $error.classList.remove("hidden");
+        return;
+      }
+
+      $success.classList.add("hidden");
+      $error.classList.add("hidden");
+      $status.classList.remove("hidden");
       $btn.disabled = true;
       resetDownloadButtons();
 
@@ -382,23 +502,34 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             filename,
-            preferences: "" // ✅ Preferences removed by design
+            preferences: ""
           })
         });
 
-        const data = await res.json();
+        const data = await res.json().catch(() => ({}));
 
-        $status.classList.add('hidden');
+        $status.classList.add("hidden");
+
+        if (res.status === 202) {
+          $btn.disabled = true;
+          $errorMsg.textContent = data?.message || "OCR is still in progress. Please wait.";
+          $error.classList.remove("hidden");
+          $previewHint.textContent = "OCR still running.";
+          return;
+        }
+
         $btn.disabled = false;
 
         if (!res.ok) {
           $errorMsg.textContent = data?.message || "Unexpected error.";
-          $error.classList.remove('hidden');
+          $error.classList.remove("hidden");
           $previewHint.textContent = "Generation failed.";
           return;
         }
 
-        if (data.docx_download_url) $docxLink.href = data.docx_download_url;
+        if (data.docx_download_url) {
+          $docxLink.href = data.docx_download_url;
+        }
 
         const pdfUrl = data.pictogram_pdf_download_url || data.pictogram_download_url || data.pictogramPdfUrl;
         if (pdfUrl) {
@@ -420,25 +551,26 @@
           $previewHint.textContent = "Generated (no structured preview returned).";
         }
 
-        $success.classList.remove('hidden');
-
+        $success.classList.remove("hidden");
       } catch (e) {
-        $status.classList.add('hidden');
+        $status.classList.add("hidden");
         $btn.disabled = false;
         $errorMsg.textContent = "Network error. Please try again.";
-        $error.classList.remove('hidden');
+        $error.classList.remove("hidden");
         $previewHint.textContent = "Generation failed.";
       }
     });
 
     // Copy JSON
-    document.getElementById('copyBtn').addEventListener('click', async () => {
+    document.getElementById("copyBtn").addEventListener("click", async () => {
       try {
         await navigator.clipboard.writeText($json.textContent || "");
-        const b = document.getElementById('copyBtn');
+        const b = document.getElementById("copyBtn");
         b.textContent = "Copied!";
-        setTimeout(() => b.textContent = "Copy JSON", 1200);
-      } catch {}
+        setTimeout(() => {
+          b.textContent = "Copy JSON";
+        }, 1200);
+      } catch (e) {}
     });
   </script>
 </body>

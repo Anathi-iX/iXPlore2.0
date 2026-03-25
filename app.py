@@ -64,7 +64,7 @@ import tiktoken
 load_dotenv()  # Load environment variables from .env file
 
 # ---- Tesseract location (Windows) ----
-tcmd = "/usr/bin/tesseract"
+tcmd = os.getenv("TESSERACT_CMD")
 if tcmd:
     pytesseract.pytesseract.tesseract_cmd = tcmd
     print("[TESSERACT] cmd =", pytesseract.pytesseract.tesseract_cmd)
@@ -351,12 +351,12 @@ def summarize_whole_doc(full_text: str, model: str = "gpt-4o-mini") -> str:
 def semantic_select_pages(extracted_text: str, question: str, filename_hint: str = "", top_k: int = 6):
     pages = split_text_into_pages(extracted_text)
 
-    doc_id = f"{filename_hint}|len={len(extracted_text or '')}"
+    text_hash = hashlib.sha1((extracted_text or "")[:50000].encode("utf-8", errors="ignore")).hexdigest()[:16]
+    doc_id = f"{filename_hint}|len={len(extracted_text or '')}|hash={text_hash}"
+
     cache = load_or_build_page_embeddings(doc_id, pages)
 
     q_emb = _embed_texts([question[:1000]])[0]
-
-    # simple keyword tokens
     q_tokens = set(re.findall(r"\w+", question.lower()))
 
     scored = []
@@ -367,32 +367,43 @@ def semantic_select_pages(extracted_text: str, question: str, filename_hint: str
         page_text = cache["pages"][i]["text"].lower()
         page_tokens = set(re.findall(r"\w+", page_text[:3000]))
 
-        # keyword overlap score
         overlap = len(q_tokens & page_tokens)
         keyword_score = overlap / max(len(q_tokens), 1)
 
-        # title page boost (first 3 pages get slight bump)
         page_no = cache["pages"][i]["page"]
-        title_boost = 0.1 if page_no <= 3 else 0.0
+
+        # Smaller first-page bias than before
+        title_boost = 0.03 if page_no <= 2 else 0.0
 
         final_score = (
-            semantic_score * 0.75 +
-            keyword_score * 0.20 +
-            title_boost * 0.05
+            semantic_score * 0.82 +
+            keyword_score * 0.15 +
+            title_boost
         )
 
         scored.append((final_score, i))
 
-    scored.sort(reverse=True, key=lambda x: x[0])
+    scored.sort(key=lambda x: x[0], reverse=True)
 
     picked = []
-    for score, idx in scored[:top_k]:
+    used_pages = set()
+
+    for score, idx in scored:
         p = cache["pages"][idx]
+        page_no = p["page"]
+
+        if page_no in used_pages:
+            continue
+        used_pages.add(page_no)
+
         picked.append({
-            "page": p["page"],
+            "page": page_no,
             "text": p["text"],
             "score": score
         })
+
+        if len(picked) >= top_k:
+            break
 
     return picked
 
@@ -467,14 +478,20 @@ def docx_to_markdown(docx_path, max_chars=16000):
 
 def build_style_and_fewshot(example_docx_path=EXAMPLE_OUTPUT_PATH,
                             example_tender_path=EXAMPLE_TENDER_PATH,
-                            tender_chars=6000, docx_chars=12000):
+                            tender_chars=2500, docx_chars=3500):
+    """
+    Keep only a LIGHT style guide.
+    We do not want the model to mirror the example too closely.
+    """
     style_guide = docx_to_markdown(example_docx_path, max_chars=docx_chars)
+
     try:
         tender_src_text = extract_text_from_pdf(example_tender_path)
     except Exception:
         tender_src_text = ""
+
     tender_snippet = (tender_src_text or "")[:tender_chars]
-    output_snippet = style_guide[:docx_chars]
+    output_snippet = (style_guide or "")[:docx_chars]
 
     return {
         "style_guide": style_guide,
@@ -483,7 +500,6 @@ def build_style_and_fewshot(example_docx_path=EXAMPLE_OUTPUT_PATH,
             "output_snippet": output_snippet
         }
     }
-
 
 def _iter_block_items(parent_doc):
     """Yield each paragraph and table in document order."""
@@ -959,12 +975,20 @@ def parse_json_loose(s: str | dict | list, key: str | None = None, prefer_array:
 
 def self_review_json(model, draft_json_str):
     review_prompt = (
-        "Review the following JSON for: (1) adherence to the schema, (2) specificity to THIS RFP, "
-        "(3) ECSA/ISO anchors present, (4) no regurgitation, (5) clear milestones with durations.\n"
-        "If improvements are needed, return an improved JSON. Otherwise, return the original JSON.\n\n"
+        "Review the following JSON output.\n\n"
+        "Check for these issues:\n"
+        "1. Generic wording that could fit many tenders\n"
+        "2. Steps that restate scope instead of explaining delivery approach\n"
+        "3. Missing tender-specific details that should have been reflected\n"
+        "4. Weak project plan rows with unrealistic or generic work packages\n"
+        "5. Missing ECSA / ISO anchors where appropriate\n"
+        "6. Overuse of template-like language\n\n"
+        "If needed, return an improved JSON version only.\n"
+        "Keep the same schema.\n"
+        "Make the wording more tender-specific and execution-focused.\n\n"
         f"{draft_json_str}"
     )
-    revised_text, _ = call_openai_text(model, review_prompt, temperature=0.2)
+    revised_text, _ = call_openai_text(model, review_prompt, temperature=0.1, max_output_tokens=6000)
     return revised_text or draft_json_str
 
 
@@ -1117,11 +1141,8 @@ def ocr_page_best_effort(pil_img: Image.Image) -> tuple[str, float]:
     configs = [
         "-l eng --oem 3 --psm 6 -c preserve_interword_spaces=1",
         "-l eng --oem 3 --psm 4 -c preserve_interword_spaces=1",
-        "-l eng --oem 3 --psm 11 -c preserve_interword_spaces=1",
-        "-l eng --oem 3 --psm 12 -c preserve_interword_spaces=1",  # sparse w/ OSD-ish behavior
-        "-l eng --oem 3 --psm 3 -c preserve_interword_spaces=1",
     ]
-
+    
     best_text = ""
     best_conf = -1.0
 
@@ -1160,32 +1181,52 @@ def ocr_page_best_effort(pil_img: Image.Image) -> tuple[str, float]:
 
 # ---------- RFP SUMMARY (gpt-5-pro) ----------
 def build_rfp_summary(full_text: str, extra_context: str, model: str = "gpt-5-pro") -> dict:
-    clipped = _clip_text_to_tokens(full_text or "", model, 85_000)
+    full_text = (full_text or "").strip()
+    if not full_text:
+        return {}
+
+    # Larger budget so long tenders are better represented
+    clipped = _clip_text_to_tokens(full_text, model, 180_000)
     extra = f"\nAdditional firm preferences / notes:\n{extra_context}\n" if extra_context else ""
 
     prompt = _responses_json_block(
         "rfp_summary",
         (
             "You are a senior bid manager and project engineer.\n"
-            "Read the FULL RFP text below and produce a compact JSON object named \"rfp_summary\".\n"
-            "Focus only on information needed to write a technical methodology and preliminary project plan.\n"
-            "Do NOT copy long clauses; summarise clearly.\n\n"
+            "Read the FULL tender / RFP text below and produce a compact but information-dense JSON object named "
+            "\"rfp_summary\".\n"
+            "Capture ONLY facts or very high-confidence inferences that are useful for writing a technical methodology "
+            "and preliminary project plan.\n"
+            "Do NOT write generic filler.\n"
+            "Do NOT copy long clauses verbatim.\n\n"
+
             "JSON structure:\n"
             "{\n"
             "  \"project_context\": string,\n"
             "  \"objectives\": [string],\n"
             "  \"scope_elements\": [string],\n"
-            "  \"sites\": [string],\n"
-            "  \"beneficiaries\": [string],\n"
-            "  \"key_constraints\": [string],\n"
             "  \"deliverables\": [string],\n"
+            "  \"work_locations\": [string],\n"
             "  \"stakeholders\": [string],\n"
+            "  \"key_personnel_requirements\": [string],\n"
+            "  \"experience_requirements\": [string],\n"
+            "  \"technical_constraints\": [string],\n"
+            "  \"commercial_constraints\": [string],\n"
+            "  \"programme_and_milestones\": [string],\n"
+            "  \"compliance_requirements\": [string],\n"
+            "  \"evaluation_signals\": [string],\n"
             "  \"ecsa_stage_hints\": [string],\n"
-            "  \"risk_drivers\": [string]\n"
+            "  \"risk_drivers\": [string],\n"
+            "  \"assumptions_to_handle_carefully\": [string]\n"
             "}\n\n"
-            "Use short bullet-like strings inside arrays.\n"
+
+            "Rules:\n"
+            "- Be specific to THIS tender.\n"
+            "- Include deadlines, submission issues, site constraints, required disciplines, and deliverables where present.\n"
+            "- If a fact is not present, omit it rather than inventing it.\n"
+            "- Arrays should contain short, dense bullet-like strings.\n"
             f"{extra}\n"
-            "=== FULL RFP TEXT ===\n"
+            "=== FULL TENDER / RFP TEXT ===\n"
             f"{clipped}\n"
         )
     )
@@ -1195,7 +1236,7 @@ def build_rfp_summary(full_text: str, extra_context: str, model: str = "gpt-5-pr
             model,
             prompt,
             temperature=0.1,
-            max_output_tokens=4500,
+            max_output_tokens=5000,
             timeout_read=480,
         )
     except Exception as e:
@@ -1207,178 +1248,778 @@ def build_rfp_summary(full_text: str, extra_context: str, model: str = "gpt-5-pr
     if not isinstance(summary, dict):
         print(f"[WARN] Could not parse rfp_summary; raw head: {str(text)[:400]}")
         return {}
-    return summary
 
+    return summary
 
 # ---------- SECTION-BY-SECTION USING SUMMARY ----------
 def generate_methodology_json_by_sections(model: str, full_text: str, extra_context: str):
     """
-    1) One call to gpt-5-pro to build a compact rfp_summary.
-    2) Multiple small calls (per section) to gpt-5-pro that only see:
-       - the rfp_summary JSON
-       - a short raw RFP extract (for nuance)
+    Better grounded methodology generation:
+    1) Build a richer tender summary.
+    2) Retrieve the most relevant tender pages/chunks for each section.
+    3) Generate each section using:
+       - structured summary
+       - targeted evidence snippets
+       - explicit anti-generic instructions
+    4) Run a final self-review pass to reduce generic/template-like output.
     """
-    rfp_summary = build_rfp_summary(full_text, extra_context, model=model)
-    summary_text = json.dumps(rfp_summary or {}, ensure_ascii=False, indent=2)
+    full_text = (full_text or "").strip()
+    if not full_text:
+        return _min_default_doc()
 
-    summary_block = f"\n=== STRUCTURED RFP SUMMARY (rfp_summary) ===\n{summary_text}\n"
-    raw_extract = _clip_text_to_tokens(full_text or "", model, 8_000)
-    raw_block = f"\n=== RAW RFP EXTRACT (for nuance only) ===\n{raw_extract}\n"
+    # -----------------------------
+    # Tender summary
+    # -----------------------------
+    rfp_summary = build_rfp_summary(full_text, extra_context, model=model)
+    if not isinstance(rfp_summary, dict):
+        rfp_summary = {}
+
+    if not rfp_summary:
+        rfp_summary = {
+            "project_context": "",
+            "objectives": [],
+            "scope_elements": [],
+            "deliverables": [],
+            "work_locations": [],
+            "stakeholders": [],
+            "key_personnel_requirements": [],
+            "experience_requirements": [],
+            "technical_constraints": [],
+            "commercial_constraints": [],
+            "programme_and_milestones": [],
+            "compliance_requirements": [],
+            "evaluation_signals": [],
+            "ecsa_stage_hints": [],
+            "risk_drivers": [],
+            "assumptions_to_handle_carefully": [],
+        }
+
+    summary_text = json.dumps(rfp_summary, ensure_ascii=False, indent=2)
 
     common_preamble = (
-        "ROLE: You are an expert Senior Engineer and Tender Writer.\n"
-        "TASK: Produce a comprehensive, high-quality technical methodology for this Tender/RFP.\n"
-        "You MUST be tender-specific and use engineering judgment (do NOT regurgitate the scope).\n\n"
-        "TONE: Professional, concise, engineering-focused, aligned to ECSA and adjudication scoring.\n\n"
-        "REQUIREMENTS:\n"
-        "- Expand the technical narrative for each relevant ECSA stage.\n"
-        "- Cover sequencing, QA, SHERQ, and community impact.\n"
-        "- Include stakeholder engagement strategy.\n"
-        "- Include procurement logic (stage-gates, fee re-pricing where applicable).\n"
-        "- Incorporate Value Engineering opportunities.\n"
-        "- Add compliance statements and referenced standards.\n"
-        "- Include document control and approvals.\n"
-        "- Risk Management must align to ISO 31000:2018 AND include bow-tie style analysis (textual is fine).\n"
-        "- Quality must align to ISO 9001:2015.\n"
+        "ROLE: You are an expert Senior Engineer, bid strategist, and tender writer.\n"
+        "TASK: Produce a high-quality technical methodology and preliminary project plan for THIS tender.\n\n"
+
+        "NON-NEGOTIABLE RULES:\n"
+        "- Be specific to THIS tender.\n"
+        "- Use tender evidence FIRST, then apply engineering judgement.\n"
+        "- Do NOT write generic consulting filler.\n"
+        "- Do NOT restate the tender; expand it into a credible delivery strategy.\n"
+        "- Write as if the document will be evaluated by experienced engineers, procurement evaluators, and infrastructure decision-makers.\n"
+        "- Use South African / ECSA / infrastructure / built-environment language where appropriate.\n"
+        "- Risk Management must align to ISO 31000:2018.\n"
+        "- Quality Assurance must align to ISO 9001:2015.\n\n"
+
+        "STRICT ENFORCEMENT:\n"
+        "- Every section must clearly reflect THIS tender's actual context, assets, constraints, delivery logic, or stakeholder environment.\n"
+        "- If a sentence could fit another unrelated tender with no edits, it is too generic and must be rewritten.\n"
+        "- Prefer concrete engineering actions over abstract management language.\n"
+        "- Prefer project conditions, system issues, interfaces, approvals, and delivery decisions over generic prose.\n"
+        "- Do not merely describe activities; explain how they will be executed in this project context.\n\n"
+
+        "MANDATORY GROUNDING RULES:\n"
+        "- Use named places, sites, systems, assets, constraints, stakeholders, or deliverables where present in the evidence.\n"
+        "- Methodology steps must refer to real project tasks such as validation, investigations, data analysis, modelling, option development, discipline coordination, approvals, tender packaging, procurement support, and implementation readiness where relevant.\n"
+        "- Project plan rows must reflect realistic sequencing and dependencies.\n"
+        "- Risks must be linked to actual project conditions, not generic consulting risks.\n"
+        "- Value engineering items must be technical optimisation ideas, not business clichés.\n\n"
+
+        "LANGUAGE QUALITY RULES:\n"
+        "- Avoid vague wording such as 'conduct assessments', 'engage stakeholders', 'prepare reports', 'review documents', unless expanded into a tender-specific engineering action.\n"
+        "- Use action verbs with technical meaning: validate, survey, analyse, model, size, verify, coordinate, package, sequence, review, approve, submit, reconcile, optimise.\n"
+        "- Where the tender gives incomplete information, make careful professional assumptions, but keep them realistic and aligned to the evidence.\n\n"
+
+        "FINAL CHECK BEFORE ANSWERING:\n"
+        "- Does this sound specific to THIS tender?\n"
+        "- Does it explain HOW delivery will happen?\n"
+        "- Does it include project facts, constraints, systems, interfaces, approvals, or stakeholders from the evidence?\n"
+        "- If not, rewrite before returning.\n"
     )
 
     if extra_context:
         common_preamble += f"\nAdditional preferences from the firm:\n{extra_context}\n"
 
+    summary_block = f"\n=== STRUCTURED TENDER SUMMARY ===\n{summary_text}\n"
+
+    enforcement_append = (
+        "\nFINAL VALIDATION:\n"
+        "- Does this section include project-specific details?\n"
+        "- Does it avoid generic consulting language?\n"
+        "- Does it explain delivery logic rather than only describing activities?\n"
+        "- If not, rewrite before returning.\n"
+    )
+
+    # -----------------------------
+    # Key facts block
+    # -----------------------------
+    key_facts = []
+    priority_keys = [
+        "project_context",
+        "objectives",
+        "scope_elements",
+        "deliverables",
+        "work_locations",
+        "stakeholders",
+        "key_personnel_requirements",
+        "experience_requirements",
+        "technical_constraints",
+        "commercial_constraints",
+        "programme_and_milestones",
+        "compliance_requirements",
+        "evaluation_signals",
+        "ecsa_stage_hints",
+        "risk_drivers",
+        "assumptions_to_handle_carefully",
+    ]
+
+    if isinstance(rfp_summary, dict):
+        for k in priority_keys:
+            v = rfp_summary.get(k)
+            if isinstance(v, list):
+                for item in v:
+                    if isinstance(item, str) and item.strip():
+                        key_facts.append(item.strip())
+            elif isinstance(v, str) and v.strip():
+                key_facts.append(v.strip())
+
+    seen = set()
+    deduped_facts = []
+    for fact in key_facts:
+        norm = fact.lower().strip()
+        if norm and norm not in seen:
+            seen.add(norm)
+            deduped_facts.append(fact)
+
+    if deduped_facts:
+        facts_block = (
+            "\n=== KEY FACTS YOU MUST USE WHERE RELEVANT ===\n"
+            + "\n".join(f"- {fact}" for fact in deduped_facts[:30])
+            + "\n"
+        )
+    else:
+        facts_block = (
+            "\n=== KEY FACTS YOU MUST USE WHERE RELEVANT ===\n"
+            "- Use only facts explicitly supported by the tender evidence snippets below.\n"
+        )
+
+    # -----------------------------
+    # Evidence helper
+    # -----------------------------
+    def evidence_block_for(section_query: str, top_k: int = 8) -> str:
+        try:
+            doc_hint = hashlib.sha1(full_text[:50000].encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+            picked = semantic_select_pages(
+                full_text,
+                section_query,
+                filename_hint=f"methodology_generation_{doc_hint}",
+                top_k=top_k
+            )
+
+            parts = []
+            seen_pages = set()
+
+            for p in picked:
+                page_no = p.get("page")
+                txt = (p.get("text") or "").strip()
+                if not txt:
+                    continue
+                if page_no in seen_pages:
+                    continue
+                seen_pages.add(page_no)
+                parts.append(f"=== PAGE {page_no} ===\n{txt[:4500]}")
+
+            if not parts:
+                raw_extract = _clip_text_to_tokens(full_text, model, 15000)
+                return f"\n=== TENDER EVIDENCE ===\n{raw_extract}\n"
+
+            return "\n=== TENDER EVIDENCE ===\n" + "\n\n---\n\n".join(parts) + "\n"
+
+        except Exception as e:
+            print(f"[WARN] evidence retrieval failed for query '{section_query}': {e}")
+            raw_extract = _clip_text_to_tokens(full_text, model, 15000)
+            return f"\n=== TENDER EVIDENCE ===\n{raw_extract}\n"
+
+    # -----------------------------
+    # Section prompts
+    # -----------------------------
     prompts = {
         "title": (
-            common_preamble +
-            "Write a short, client-appropriate TITLE for this deliverable (max ~16 words).\n"
-            "It should sound like a formal methodology / project plan document.\n"
-            + summary_block + raw_block +
-            "\n" + _responses_json_block("title", "title: string")
+            common_preamble
+            + "Write a short formal title for the deliverable, suitable for a branded engineering submission.\n"
+              "The title must reflect the tender purpose, project type, or delivery objective and must not be a generic reusable heading.\n"
+            + summary_block
+            + facts_block
+            + evidence_block_for("tender title client project name scope methodology preliminary project plan", top_k=6)
+            + "\n"
+            + _responses_json_block("title", "title: string")
         ),
+
         "context_objectives": (
-            common_preamble +
-            "Summarise the context & objectives in 1–2 compact paragraphs.\n"
-            "Focus on: site/beneficiaries, problem/opportunity, drivers, success criteria.\n"
-            + summary_block + raw_block +
-            "\n" + _responses_json_block("context_objectives", "context_objectives: string")
+            common_preamble
+            + "Write 2 to 4 compact paragraphs describing the project context and objectives.\n"
+              "You must include the actual client need, project type, location context, work purpose, intended delivery outcomes, and any meaningful constraints or stakeholder conditions visible in the tender.\n"
+              "This section must sound specific to this tender and should not read like a reusable introduction.\n"
+            + summary_block
+            + facts_block
+            + evidence_block_for(
+                "project context objectives client need scope work location stakeholders constraints deliverables programme outcomes compliance",
+                top_k=8
+            )
+            + "\n"
+            + _responses_json_block("context_objectives", "context_objectives: string")
         ),
+
         "methodology": (
             common_preamble +
-            "Provide a Detailed Technical Methodology aligned to ECSA stages.\n"
-            "Output as an ARRAY of phases; each phase has a name and 4–10 clear, concise bullet steps.\n"
-            + summary_block + raw_block +
-            "\n" + _responses_json_block(
+            "Produce the core technical methodology aligned to realistic ECSA stages.\n\n"
+
+            "OUTPUT STRUCTURE:\n"
+            "- Return an ARRAY of phases\n"
+            "- Each phase must include:\n"
+            "  • a phase name\n"
+            "  • 6–10 execution steps\n\n"
+
+            "STEP QUALITY STANDARD (CRITICAL):\n"
+            "Each step must:\n"
+            "1. Describe a CLEAR engineering action (not a vague activity)\n"
+            "2. Reference a relevant project element where possible (location, asset, system, constraint)\n"
+            "3. Explain the PURPOSE of the step in this project\n"
+            "4. Where relevant, include decision logic or evaluation criteria\n\n"
+
+            "ENGINEERING DEPTH GUIDANCE:\n"
+            "- Focus on HOW the work will be executed, not just WHAT will be done\n"
+            "- Include investigation, validation, modelling, option development, coordination, and approvals where appropriate\n"
+            "- Include technical reasoning where it adds value, but avoid unnecessary over-detail\n"
+            "- Not every step needs heavy optimisation logic — use judgement\n\n"
+
+            "ANTI-GENERIC RULES:\n"
+            "- Avoid vague phrases like 'conduct assessments', 'engage stakeholders', 'prepare reports'\n"
+            "- Instead, anchor actions to real project tasks or systems\n"
+            "- If a step could apply to almost any project without modification, improve it\n\n"
+
+            "ACCEPTABLE STYLE EXAMPLES:\n"
+            "- Analyse available pipe failure records to identify high-risk replacement corridors\n"
+            "- Develop a hydraulic model of the existing network to assess pressure and capacity constraints\n"
+            "- Evaluate whether gravity sewer extensions are feasible based on topography and existing infrastructure\n\n"
+
+            "BALANCE RULE:\n"
+            "- Aim for strong, practical engineering content (8.5–9/10 level)\n"
+            "- Do not overcomplicate every step with excessive detail\n"
+            "- Prioritise clarity, realism, and deliverability\n\n"
+
+            "FINAL CHECK BEFORE ANSWERING:\n"
+            "- Does this reflect how an experienced engineer would actually approach this project?\n"
+            "- Are the steps clear, logical, and grounded in the tender context?\n"
+            "- Is the level of detail appropriate (not too generic, not overly dense)?\n\n"
+
+            + summary_block
+            + facts_block
+            + evidence_block_for(
+                "infrastructure condition pipeline failures sewer network hydraulic modelling pump stations prioritisation investigations design",
+                top_k=8
+            )
+            + "\n"
+            + _responses_json_block(
                 "methodology",
                 'methodology: [{"phase": string, "steps": [string]}]'
             )
         ),
+
         "plan_table": (
             common_preamble +
-            "Produce a preliminary project plan with milestones & durations as an ARRAY of rows.\n"
-            "Use realistic durations and dependencies; reflect ECSA stages and key deliverables.\n"
-            + summary_block + raw_block +
-            "\n" + _responses_json_block(
+            "Produce a realistic preliminary project plan as an ARRAY of rows.\n\n"
+
+            "OUTPUT STRUCTURE:\n"
+            "- Each row must contain:\n"
+            "  • work_package\n"
+            "  • owner\n"
+            "  • start\n"
+            "  • finish\n"
+            "  • duration_weeks\n"
+            "  • dependencies\n"
+            "  • deliverables\n"
+            "  • acceptance_criteria\n\n"
+
+            "QUALITY STANDARD:\n"
+            "- Build the programme the way an experienced engineering consultancy would actually deliver the work\n"
+            "- Sequence work logically from mobilisation through investigations, analysis, design development, reviews, approvals, tender documentation, and closeout where relevant\n"
+            "- Use work packages that reflect the actual tender scope, systems, and delivery requirements\n"
+            "- Include technical and review activities where they materially affect delivery\n\n"
+
+            "ANTI-GENERIC RULES:\n"
+            "- Avoid generic row names like 'Planning', 'Design', or 'Reporting' unless expanded into project-specific work\n"
+            "- Each row should reflect a real delivery package that fits this tender\n"
+            "- Dependencies must be believable and technically logical\n"
+            "- Acceptance criteria must describe what makes the package complete or usable\n\n"
+
+            "PRACTICAL GUIDANCE:\n"
+            "- 'owner' should be a role or discipline lead, not a person’s name\n"
+            "- 'start' and 'finish' may be expressed as Week 1, Week 2, etc.\n"
+            "- 'duration_weeks' must be numeric\n"
+            "- Use enough rows to show meaningful delivery logic, but do not over-fragment the programme\n\n"
+
+            "BALANCE RULE:\n"
+            "- Aim for a strong, credible project plan, not an overly elaborate master schedule\n"
+            "- Prefer realistic packages and clear sequencing over excessive detail\n\n"
+
+            "FINAL CHECK BEFORE ANSWERING:\n"
+            "- Would this plan make sense to an engineer, project manager, or bid evaluator?\n"
+            "- Does it reflect the real workflow of this tender?\n"
+            "- Are the work packages specific enough to avoid sounding reusable?\n\n"
+
+            + summary_block
+            + facts_block
+            + evidence_block_for(
+                "programme milestones deadlines deliverables approvals investigations design tender documentation procurement support review meetings",
+                top_k=8
+            )
+            + "\n"
+            + _responses_json_block(
                 "plan_table",
-                'plan_table: [{"work_package": string, "owner": string, "start": string, "finish": string, '
-                '"duration_weeks": number, "dependencies": string, "deliverables": string, "acceptance_criteria": string}]'
+                'plan_table: [{"work_package": string, "owner": string, "start": string, "finish": string, "duration_weeks": number, "dependencies": string, "deliverables": string, "acceptance_criteria": string}]'
             )
         ),
+
         "project_management": (
             common_preamble +
-            "Describe the Project Management approach: governance/roles and controls/reporting.\n"
-            "Keep it concise but concrete; align with how the client likely expects to be engaged.\n"
-            + summary_block + raw_block +
-            "\n" + _responses_json_block(
+            "Describe the project management approach in a concise but concrete way.\n\n"
+
+            "OUTPUT STRUCTURE:\n"
+            "- governance: short but specific narrative on governance, roles, interfaces, and engagement model\n"
+            "- controls: short but specific narrative on planning, reporting, design coordination, change control, issue tracking, and review cycles\n\n"
+
+            "QUALITY STANDARD:\n"
+            "- The response must reflect how this appointment would actually be managed\n"
+            "- Cover the management structure needed to support technical delivery, client engagement, design coordination, and approvals\n"
+            "- Make the level of governance fit the likely project size and complexity\n\n"
+
+            "ANTI-GENERIC RULES:\n"
+            "- Avoid vague management language that could apply to any project\n"
+            "- Avoid generic statements like 'regular meetings will be held' unless you explain purpose and relevance\n"
+            "- Tie governance and controls to this tender’s likely stakeholders, deliverables, review cycles, and technical interfaces\n\n"
+
+            "BALANCE RULE:\n"
+            "- Keep it practical and credible\n"
+            "- Do not over-engineer the governance model if the tender appears straightforward\n\n"
+
+            "FINAL CHECK BEFORE ANSWERING:\n"
+            "- Does this sound like a real delivery management approach for this project?\n"
+            "- Is it specific enough to this tender to avoid reading like boilerplate?\n\n"
+
+            + summary_block
+            + facts_block
+            + evidence_block_for(
+                "project management governance reporting coordination client engagement approvals meetings technical review interfaces",
+                top_k=7
+            )
+            + "\n"
+            + _responses_json_block(
                 "project_management",
                 'project_management: {"governance": string, "controls": string}'
             )
         ),
+
+        "project_management": (
+            common_preamble +
+            "Describe the project management approach in a concise but concrete way.\n\n"
+
+            "OUTPUT STRUCTURE:\n"
+            "- governance: short but specific narrative on governance, roles, interfaces, and engagement model\n"
+            "- controls: short but specific narrative on planning, reporting, design coordination, change control, issue tracking, and review cycles\n\n"
+
+            "QUALITY STANDARD:\n"
+            "- The response must reflect how this appointment would actually be managed\n"
+            "- Cover the management structure needed to support technical delivery, client engagement, design coordination, and approvals\n"
+            "- Make the level of governance fit the likely project size and complexity\n\n"
+
+            "ANTI-GENERIC RULES:\n"
+            "- Avoid vague management language that could apply to any project\n"
+            "- Avoid generic statements like 'regular meetings will be held' unless you explain purpose and relevance\n"
+            "- Tie governance and controls to this tender’s likely stakeholders, deliverables, review cycles, and technical interfaces\n\n"
+
+            "BALANCE RULE:\n"
+            "- Keep it practical and credible\n"
+            "- Do not over-engineer the governance model if the tender appears straightforward\n\n"
+
+            "FINAL CHECK BEFORE ANSWERING:\n"
+            "- Does this sound like a real delivery management approach for this project?\n"
+            "- Is it specific enough to this tender to avoid reading like boilerplate?\n\n"
+
+            + summary_block
+            + facts_block
+            + evidence_block_for(
+                "project management governance reporting coordination client engagement approvals meetings technical review interfaces",
+                top_k=7
+            )
+            + "\n"
+            + _responses_json_block(
+                "project_management",
+                'project_management: {"governance": string, "controls": string}'
+            )
+        ),
+
         "risk": (
             common_preamble +
-            "Describe Risk Management per ISO 31000:2018.\n"
-            "Provide a short framework paragraph and 5–8 top risks with treatments, tailored to this RFP.\n"
-            "You may describe bow-tie analysis textually.\n"
-            + summary_block + raw_block +
-            "\n" + _responses_json_block(
+            "Write a tender-specific risk management section aligned to ISO 31000:2018.\n\n"
+
+            "OUTPUT STRUCTURE:\n"
+            "- framework: one concise paragraph describing the risk management approach\n"
+            "- top_risks: 5–8 tailored risk items, each with a name and treatment\n\n"
+
+            "QUALITY STANDARD:\n"
+            "- The framework paragraph must describe how risks will be identified, assessed, tracked, reviewed, and treated during delivery\n"
+            "- The risk items must be grounded in real project conditions, delivery interfaces, approvals, data gaps, stakeholder issues, programme risks, or system constraints suggested by the tender\n"
+            "- Treatments must be practical and proportionate\n\n"
+
+            "ANTI-GENERIC RULES:\n"
+            "- Avoid generic risks unless they are clearly linked to this project context\n"
+            "- Avoid weak labels like 'regulatory delays' or 'stakeholder issues' without explaining what drives them here\n"
+            "- Each treatment must explain a believable mitigation approach, not a generic control phrase\n\n"
+
+            "ACCEPTABLE STYLE:\n"
+            "- Delays in confirming hydraulic input data for the existing network may affect option selection; this will be mitigated through early data validation and targeted engineering assumptions review\n\n"
+
+            "BALANCE RULE:\n"
+            "- Aim for realistic and project-relevant risks\n"
+            "- Do not force dramatic or speculative risks if the evidence does not support them\n\n"
+
+            "FINAL CHECK BEFORE ANSWERING:\n"
+            "- Are these risks clearly tied to this project?\n"
+            "- Are the mitigations practical and engineering-led?\n\n"
+
+            + summary_block
+            + facts_block
+            + evidence_block_for(
+                "risk constraints approvals access utilities information gaps programme environmental stakeholders procurement technical uncertainty",
+                top_k=7
+            )
+            + "\n"
+            + _responses_json_block(
                 "risk",
                 'risk: {"framework": string, "top_risks": [{"name": string, "treatment": string}]}'
             )
         ),
+        
         "quality": (
             common_preamble +
-            "Describe Quality Assurance & Control per ISO 9001:2015.\n"
-            "Summarise the QA plan and key controls (reviews, approvals, audits, document control).\n"
-            + summary_block + raw_block +
-            "\n" + _responses_json_block(
+            "Write a quality assurance and control section aligned to ISO 9001:2015.\n\n"
+
+            "OUTPUT STRUCTURE:\n"
+            "- qa_plan: concise narrative describing the overall QA approach\n"
+            "- controls: concise narrative describing the practical quality controls that will be applied\n\n"
+
+            "QUALITY STANDARD:\n"
+            "- The response must explain how deliverables will be checked, coordinated, reviewed, approved, and issued\n"
+            "- Include discipline review, document control, revision management, internal checking, and submission readiness where relevant\n"
+            "- Tailor the quality approach to the likely outputs of this tender such as reports, drawings, calculations, tender documents, or approval submissions\n\n"
+
+            "ANTI-GENERIC RULES:\n"
+            "- Avoid generic statements like 'quality will be maintained throughout the project'\n"
+            "- Avoid repeating ISO language without explaining what it means in practice\n"
+            "- The controls must sound like real consulting engineering QA actions\n\n"
+
+            "BALANCE RULE:\n"
+            "- Keep the content practical and delivery-focused\n"
+            "- Do not turn this into a generic quality manual summary\n\n"
+
+            "FINAL CHECK BEFORE ANSWERING:\n"
+            "- Does this explain how quality will actually be controlled on this appointment?\n"
+            "- Is it aligned to likely deliverables and review requirements in this tender?\n\n"
+
+            + summary_block
+            + facts_block
+            + evidence_block_for(
+                "quality assurance reviews drawings reports submissions document control approvals coordination calculations",
+                top_k=7
+            )
+            + "\n"
+            + _responses_json_block(
                 "quality",
                 'quality: {"qa_plan": string, "controls": string}'
             )
         ),
+
         "additional_services": (
             common_preamble +
-            "List additional ECSA-aligned optional services that could be offered beyond the base scope.\n"
-            "Only include items that are plausibly relevant to this RFP.\n"
-            + summary_block + raw_block +
-            "\n" + _responses_json_block("additional_services", 'additional_services: [string]')
-        ),
-        "assumptions": (
-            common_preamble +
-            "List explicit assumptions & dependencies underpinning the methodology and plan.\n"
-            "These should cover: information, access, approvals, third-party actions, etc.\n"
-            + summary_block + raw_block +
-            "\n" + _responses_json_block("assumptions", 'assumptions: [string]')
-        ),
-        "references": (
-            common_preamble +
-            "List referenced standards/guidelines/documents (bullets).\n"
-            "Include ECSA guidelines and relevant ISO standards, plus any obvious national frameworks.\n"
-            + summary_block + raw_block +
-            "\n" + _responses_json_block("references", 'references: [string]')
+            "List only genuinely relevant additional services that could strengthen this appointment.\n\n"
+
+            "QUALITY STANDARD:\n"
+            "- Include only supplementary services that are plausible for this tender and would add clear delivery value\n"
+            "- Focus on specialist inputs, investigations, advisory support, or implementation-stage services that fit the project type\n\n"
+
+            "ANTI-GENERIC RULES:\n"
+            "- Avoid generic upselling\n"
+            "- Do not include services that feel disconnected from the tender scope or project risks\n"
+            "- Each item should sound like something a serious engineering team might credibly offer as an enhancement\n\n"
+
+            "BALANCE RULE:\n"
+            "- Keep the list selective and relevant\n"
+            "- Fewer strong items are better than a padded list\n\n"
+
+            "FINAL CHECK BEFORE ANSWERING:\n"
+            "- Would these services genuinely strengthen delivery for this project?\n"
+            "- Are they specific enough to avoid sounding like a stock list?\n\n"
+
+            + summary_block
+            + facts_block
+            + evidence_block_for(
+                "optional services specialist studies surveys investigations monitoring geotech environmental social traffic cost implementation support",
+                top_k=7
+            )
+            + "\n"
+            + _responses_json_block("additional_services", 'additional_services: [string]')
         ),
 
-        # NEW SECTIONS
+        "assumptions": (
+            common_preamble +
+            "List realistic assumptions and dependencies underpinning the methodology and project plan.\n\n"
+
+            "QUALITY STANDARD:\n"
+            "- Include assumptions that materially affect delivery logic, programme, pricing logic, investigations, access, approvals, information availability, or stakeholder inputs\n"
+            "- Assumptions must be relevant to this tender and framed in a professional engineering manner\n\n"
+
+            "ANTI-GENERIC RULES:\n"
+            "- Avoid weak generic assumptions like 'the client will cooperate'\n"
+            "- Each assumption should be linked to a real dependency or delivery condition suggested by the tender\n"
+            "- Avoid padding the list with obvious statements that add no value\n\n"
+
+            "BALANCE RULE:\n"
+            "- Keep assumptions realistic, practical, and decision-useful\n"
+            "- Do not use them as a substitute for methodology detail\n\n"
+
+            "FINAL CHECK BEFORE ANSWERING:\n"
+            "- Are these assumptions actually relevant to this project?\n"
+            "- Would a bid reviewer recognise them as meaningful delivery dependencies?\n\n"
+
+            + summary_block
+            + facts_block
+            + evidence_block_for(
+                "assumptions dependencies approvals access client information site data surveys third party interfaces timelines",
+                top_k=7
+            )
+            + "\n"
+            + _responses_json_block("assumptions", 'assumptions: [string]')
+        ),
+
+        "references": (
+            common_preamble +
+            "List relevant referenced standards, guidelines, frameworks, or compliance anchors for this tender.\n\n"
+
+            "QUALITY STANDARD:\n"
+            "- Include only references that make sense for the type of work, the delivery environment, or the required management systems\n"
+            "- Include ECSA and ISO anchors where appropriate, and other relevant South African or sector-specific references if clearly applicable\n\n"
+
+            "ANTI-GENERIC RULES:\n"
+            "- Do not pad the list with irrelevant standards\n"
+            "- Do not include references that have no clear relationship to the project type or deliverables\n\n"
+
+            "BALANCE RULE:\n"
+            "- Keep the list focused and credible\n"
+            "- A shorter relevant list is better than a long generic one\n\n"
+
+            "FINAL CHECK BEFORE ANSWERING:\n"
+            "- Does each reference have a clear reason to appear in this tender response?\n\n"
+
+            + summary_block
+            + facts_block
+            + evidence_block_for(
+                "standards compliance requirements specifications guidelines codes legislation frameworks",
+                top_k=6
+            )
+            + "\n"
+            + _responses_json_block("references", 'references: [string]')
+        ),
+
         "deliverables_register": (
             common_preamble +
-            "Create a Deliverables Register mapped to this tender.\n"
-            "Return an ARRAY of deliverable rows.\n"
-            + summary_block + raw_block +
-            "\n" + _responses_json_block(
+            "Create a deliverables register mapped to this tender.\n\n"
+
+            "OUTPUT STRUCTURE:\n"
+            "- Each row must contain:\n"
+            "  • deliverable\n"
+            "  • ecsa_stage\n"
+            "  • owner\n"
+            "  • format\n"
+            "  • acceptance_criteria\n\n"
+
+            "QUALITY STANDARD:\n"
+            "- Include deliverables that are either explicitly indicated in the tender or strongly implied by a realistic engineering delivery process\n"
+            "- The register must reflect the likely outputs of this appointment, such as reports, drawings, cost estimates, models, submissions, or tender documents where relevant\n"
+            "- Acceptance criteria must describe what makes the deliverable fit for client review, approval, or issue\n\n"
+
+            "ANTI-GENERIC RULES:\n"
+            "- Avoid generic rows that could appear in any consultancy register unchanged\n"
+            "- Each deliverable should feel connected to the project type, scope, stage logic, or submission requirements\n\n"
+
+            "BALANCE RULE:\n"
+            "- Keep the register practical and believable\n"
+            "- Include enough detail to be useful, but do not overcomplicate it\n\n"
+
+            "FINAL CHECK BEFORE ANSWERING:\n"
+            "- Would this register make sense to a bid reviewer or engineering lead?\n"
+            "- Does it reflect this appointment rather than a generic template?\n\n"
+
+            + summary_block
+            + facts_block
+            + evidence_block_for(
+                "deliverables reports drawings submissions returnables methodology programme design documents approval packs tender documents",
+                top_k=8
+            )
+            + "\n"
+            + _responses_json_block(
                 "deliverables_register",
                 'deliverables_register: [{"deliverable": string, "ecsa_stage": string, "owner": string, "format": string, "acceptance_criteria": string}]'
             )
         ),
+        
         "document_control": (
             common_preamble +
-            "Provide Document Control and Approval content suitable for a bid submission.\n"
-            + summary_block + raw_block +
-            "\n" + _responses_json_block(
+            "Provide document control and approvals content suitable for a professional engineering bid response.\n\n"
+
+            "OUTPUT STRUCTURE:\n"
+            "- document_metadata: concise description of how documents will be identified and controlled\n"
+            "- review_approval: concise description of the review and approval workflow\n\n"
+
+            "QUALITY STANDARD:\n"
+            "- The response must describe practical control of document versions, issue status, revisions, and approvals\n"
+            "- It must fit the likely deliverables and review cycles of this appointment\n"
+            "- The approval workflow should reflect real internal review and controlled external issue processes\n\n"
+
+            "ANTI-GENERIC RULES:\n"
+            "- Avoid document-control boilerplate that sounds copied from a quality manual\n"
+            "- Keep it aligned to engineering deliverables and submission workflow\n\n"
+
+            "BALANCE RULE:\n"
+            "- Keep it concise and useful\n"
+            "- Do not over-formalise this section unless the tender clearly demands it\n\n"
+
+            "FINAL CHECK BEFORE ANSWERING:\n"
+            "- Does this read like a usable document-control approach for this appointment?\n\n"
+
+            + summary_block
+            + facts_block
+            + evidence_block_for(
+                "document control revisions submissions approvals issue for review issue for approval deliverables",
+                top_k=6
+            )
+            + "\n"
+            + _responses_json_block(
                 "document_control",
                 'document_control: {"document_metadata": string, "review_approval": string}'
             )
         ),
+
         "stakeholder_engagement": (
             common_preamble +
-            "Provide a stakeholder engagement strategy tailored to this tender.\n"
-            + summary_block + raw_block +
-            "\n" + _responses_json_block(
+            "Provide a stakeholder engagement strategy tailored to this tender and its context.\n\n"
+
+            "OUTPUT STRUCTURE:\n"
+            "- approach: concise narrative on the engagement strategy\n"
+            "- channels: list of practical engagement channels or forums\n\n"
+
+            "QUALITY STANDARD:\n"
+            "- Reflect the actual stakeholder environment suggested by the tender, such as client representatives, technical reviewers, user departments, communities, authorities, or other interfaces\n"
+            "- Explain how engagement will support delivery, coordination, approvals, information gathering, or implementation readiness\n"
+            "- Keep the tone practical rather than ceremonial\n\n"
+
+            "ANTI-GENERIC RULES:\n"
+            "- Avoid generic phrases like 'stakeholders will be engaged throughout the project'\n"
+            "- Explain the purpose of engagement in the project context\n"
+            "- Do not invent elaborate stakeholder structures unless the evidence supports them\n\n"
+
+            "BALANCE RULE:\n"
+            "- Be practical, specific, and proportionate to the project\n"
+            "- Do not overstate community or authority engagement if the tender does not suggest it\n\n"
+
+            "FINAL CHECK BEFORE ANSWERING:\n"
+            "- Does this engagement strategy clearly support the delivery of this project?\n"
+            "- Is it grounded in likely real stakeholders for this tender?\n\n"
+
+            + summary_block
+            + facts_block
+            + evidence_block_for(
+                "stakeholders client departments users communities authorities technical review meetings engagement approvals",
+                top_k=8
+            )
+            + "\n"
+            + _responses_json_block(
                 "stakeholder_engagement",
                 'stakeholder_engagement: {"approach": string, "channels": [string]}'
             )
         ),
+        
         "procurement_logic": (
             common_preamble +
-            "Provide procurement logic tailored to this tender.\n"
-            "Include a clear stage-gate approach and fee re-pricing logic where permitted.\n"
-            + summary_block + raw_block +
-            "\n" + _responses_json_block(
+            "Provide procurement logic and stage-gate controls relevant to this appointment.\n\n"
+
+            "OUTPUT STRUCTURE:\n"
+            "- stage_gates: list of logical project stage-gates or control points\n"
+            "- fee_repricing: concise explanation only if relevant and appropriate\n\n"
+
+            "QUALITY STANDARD:\n"
+            "- The stage-gates must reflect a believable consulting engineering delivery path for this tender\n"
+            "- Show how scope maturity, review points, design progression, or tender packaging would be controlled\n"
+            "- If fee repricing is included, it must be commercially sensible and appropriate to the appointment structure\n\n"
+
+            "ANTI-GENERIC RULES:\n"
+            "- Avoid generic stage labels without explaining their relevance to delivery progression\n"
+            "- Do not force fee repricing language if it does not fit the tender or appointment structure\n\n"
+
+            "BALANCE RULE:\n"
+            "- Keep this commercially aware but still grounded in project delivery\n"
+            "- Keep it concise and practical\n\n"
+
+            "FINAL CHECK BEFORE ANSWERING:\n"
+            "- Would this procurement logic make sense to a bid reviewer or project director?\n"
+            "- Is it aligned to the likely delivery stages of this project?\n\n"
+
+            + summary_block
+            + facts_block
+            + evidence_block_for(
+                "procurement stage gates pricing deliverables approvals design progression tender packaging",
+                top_k=6
+            )
+            + "\n"
+            + _responses_json_block(
                 "procurement_logic",
                 'procurement_logic: {"stage_gates": [string], "fee_repricing": string}'
             )
         ),
+
         "value_engineering": (
             common_preamble +
-            "List 5–10 tender-relevant Value Engineering opportunities.\n"
-            "They must be specific to this type of work and context.\n"
-            + summary_block + raw_block +
-            "\n" + _responses_json_block(
+            "List 5–10 value engineering opportunities genuinely relevant to this project.\n\n"
+
+            "QUALITY STANDARD:\n"
+            "- Each item must be a technical optimisation idea relevant to the project systems, design development, constructability, lifecycle performance, coordination, or delivery efficiency\n"
+            "- The items must sound like engineering judgement, not generic commercial language\n"
+            "- Where possible, link each item to a system element, design issue, delivery challenge, or optimisation opportunity suggested by the tender\n\n"
+
+            "ANTI-GENERIC RULES:\n"
+            "- Avoid broad clichés like 'optimise resources' or 'improve efficiency'\n"
+            "- Each item must describe a concrete optimisation opportunity and its likely benefit\n"
+            "- Do not include VE ideas that feel disconnected from the project type\n\n"
+
+            "ACCEPTABLE STYLE:\n"
+            "- Rationalise pipe diameters using calibrated hydraulic modelling to avoid over-design while maintaining required service levels\n\n"
+
+            "BALANCE RULE:\n"
+            "- Aim for technically credible VE ideas without forcing artificial sophistication\n"
+            "- Strong, relevant ideas are better than a long generic list\n\n"
+
+            "FINAL CHECK BEFORE ANSWERING:\n"
+            "- Do these read like real engineering optimisation ideas for this project?\n"
+            "- Would they differentiate the bid in a credible way?\n\n"
+
+            + summary_block
+            + facts_block
+            + evidence_block_for(
+                "value engineering constructability lifecycle cost optimisation design coordination materials staging hydraulic modelling",
+                top_k=7
+            )
+            + "\n"
+            + _responses_json_block(
                 "value_engineering",
                 "value_engineering: [string]"
             )
@@ -1387,20 +2028,20 @@ def generate_methodology_json_by_sections(model: str, full_text: str, extra_cont
 
     caps = {
         "title": 250,
-        "context_objectives": 1600,
-        "methodology": 5000,
-        "plan_table": 4500,
-        "project_management": 1800,
-        "risk": 2200,
+        "context_objectives": 1800,
+        "methodology": 6500,
+        "plan_table": 5000,
+        "project_management": 2000,
+        "risk": 2400,
         "quality": 1800,
-        "additional_services": 900,
-        "assumptions": 900,
-        "references": 700,
-        "deliverables_register": 2200,
-        "document_control": 900,
-        "stakeholder_engagement": 1200,
-        "procurement_logic": 900,
-        "value_engineering": 900,
+        "additional_services": 1000,
+        "assumptions": 1000,
+        "references": 900,
+        "deliverables_register": 2600,
+        "document_control": 1000,
+        "stakeholder_engagement": 1400,
+        "procurement_logic": 1000,
+        "value_engineering": 1000,
     }
 
     array_keys = {
@@ -1433,30 +2074,198 @@ def generate_methodology_json_by_sections(model: str, full_text: str, extra_cont
 
         blob = parse_json_loose(text, key=key, prefer_array=(key in array_keys))
         val = blob.get(key) if isinstance(blob, dict) else None
+
         if val is None and isinstance(text, str):
             print(f"[DEBUG] Raw section head for {key}: {text[:400]}")
+
         results[key] = val
 
     base = _min_default_doc()
 
-    merged = {
-        "title": results.get("title") or base["title"],
-        "context_objectives": results.get("context_objectives") or base["context_objectives"],
-        "methodology": results.get("methodology") or base["methodology"],
-        "plan_table": results.get("plan_table") or base["plan_table"],
-        "project_management": results.get("project_management") or base["project_management"],
-        "risk": results.get("risk") or base["risk"],
-        "quality": results.get("quality") or base["quality"],
-        "additional_services": results.get("additional_services") or base["additional_services"],
-        "assumptions": results.get("assumptions") or base["assumptions"],
-        "references": results.get("references") or base["references"],
+    def merge_field(key):
+        val = results.get(key)
+        return val if not _is_effectively_empty(val) else base[key]
 
-        "deliverables_register": results.get("deliverables_register") or base["deliverables_register"],
-        "document_control": results.get("document_control") or base["document_control"],
-        "stakeholder_engagement": results.get("stakeholder_engagement") or base["stakeholder_engagement"],
-        "procurement_logic": results.get("procurement_logic") or base["procurement_logic"],
-        "value_engineering": results.get("value_engineering") or base["value_engineering"],
+    def merge_nested_dict(key, expected_keys):
+        raw = results.get(key)
+        if not isinstance(raw, dict):
+            return base[key]
+
+        out = {}
+        for subkey in expected_keys:
+            subval = raw.get(subkey)
+            if _is_effectively_empty(subval):
+                out[subkey] = base[key].get(subkey)
+            else:
+                out[subkey] = subval
+        return out
+
+    merged = {
+        "title": merge_field("title"),
+        "context_objectives": merge_field("context_objectives"),
+        "methodology": merge_field("methodology"),
+        "plan_table": merge_field("plan_table"),
+        "project_management": merge_nested_dict("project_management", ["governance", "controls"]),
+        "risk": merge_nested_dict("risk", ["framework", "top_risks"]),
+        "quality": merge_nested_dict("quality", ["qa_plan", "controls"]),
+        "additional_services": merge_field("additional_services"),
+        "assumptions": merge_field("assumptions"),
+        "references": merge_field("references"),
+        "deliverables_register": merge_field("deliverables_register"),
+        "document_control": merge_nested_dict("document_control", ["document_metadata", "review_approval"]),
+        "stakeholder_engagement": merge_nested_dict("stakeholder_engagement", ["approach", "channels"]),
+        "procurement_logic": merge_nested_dict("procurement_logic", ["stage_gates", "fee_repricing"]),
+        "value_engineering": merge_field("value_engineering"),
     }
+
+    # -----------------------------
+    # Final anti-generic self-review
+    # -----------------------------
+    try:
+        review_prompt = (
+            "Review the following tender methodology JSON against the tender summary and key facts.\n\n"
+
+            "YOUR ROLE:\n"
+            "You are acting as a senior technical reviewer performing a final bid-quality pass.\n"
+            "Your job is NOT to rewrite everything.\n"
+            "Your job is to identify weak, generic, shallow, repetitive, or non-differentiated content and upgrade it into a stronger final-draft position.\n\n"
+
+            "PRIMARY OBJECTIVE:\n"
+            "Make the output read like it was prepared by an experienced engineering consultancy that understands THIS specific tender.\n\n"
+
+            "STRICT REVIEW TESTS:\n"
+            "For every section, test the content against these questions:\n"
+            "1. Could this wording apply to many unrelated tenders?\n"
+            "2. Does it describe activities without explaining engineering reasoning?\n"
+            "3. Does it restate scope instead of explaining delivery strategy?\n"
+            "4. Does it miss obvious project-specific facts, systems, locations, constraints, or stakeholder realities?\n"
+            "5. Does it sound like template language instead of a tailored engineering submission?\n"
+            "6. Does it fail to explain sequencing, trade-offs, decisions, dependencies, or quality controls?\n\n"
+
+            "MANDATORY IMPROVEMENT RULES:\n"
+            "- Keep EXACTLY the same JSON schema.\n"
+            "- Return valid JSON only.\n"
+            "- Preserve good content that is already specific and strong.\n"
+            "- Rewrite only weak content, but rewrite it decisively.\n"
+            "- Replace vague wording with technically grounded wording.\n"
+            "- Replace generic consulting language with project-specific engineering language.\n"
+            "- Strengthen delivery logic, technical reasoning, and practical execution detail.\n\n"
+
+            "METHODOLOGY REVIEW RULES:\n"
+            "- Every phase must feel necessary for THIS tender.\n"
+            "- Every step must explain HOW the work will be executed.\n"
+            "- Every step must include at least one project-specific reference such as a system, asset, location, condition, approval path, interface, or delivery constraint.\n"
+            "- Every step should contain engineering reasoning, such as prioritisation, validation, option selection, coordination logic, constructability thinking, or compliance response.\n"
+            "- Remove steps that are mere placeholders, inflated wording, or duplicate ideas.\n"
+            "- If a step says only 'conduct', 'review', 'prepare', 'assess', or 'engage' without deeper detail, rewrite it.\n\n"
+
+            "PROJECT PLAN REVIEW RULES:\n"
+            "- Every row must reflect realistic engineering sequencing.\n"
+            "- Work packages must be tender-specific, not generic lifecycle headings.\n"
+            "- Dependencies must show actual logic between investigations, design, approvals, submissions, procurement, and deliverables.\n"
+            "- Acceptance criteria must describe what makes the work package complete in a meaningful way.\n"
+            "- Remove rows that are too vague or repetitive.\n"
+            "- Improve rows that do not clearly support delivery of THIS tender.\n\n"
+
+            "RISK REVIEW RULES:\n"
+            "- Risks must be tied to real tender conditions.\n"
+            "- Rewrite generic risks into project-specific risks with a clear cause and consequence.\n"
+            "- Treatments must be practical and targeted, not generic control statements.\n"
+            "- Risks should sound like they came from an engineer who understands the project context.\n\n"
+
+            "QUALITY REVIEW RULES:\n"
+            "- QA/QC must go beyond 'peer review' and 'document control'.\n"
+            "- It must describe review gates, interdisciplinary checks, deliverable verification, compliance checks, and issue close-out logic relevant to the tender.\n"
+            "- Rewrite generic QA wording into specific bid-quality engineering QA language.\n\n"
+
+            "STAKEHOLDER / PROCUREMENT / VALUE ENGINEERING REVIEW RULES:\n"
+            "- These sections must not sound copied from a company boilerplate.\n"
+            "- Stakeholder engagement must reflect the likely project interfaces, approvals environment, and user/community realities.\n"
+            "- Procurement logic must reflect the actual packaging, stage-gates, or tender support logic where relevant.\n"
+            "- Value engineering must describe real technical optimisation opportunities, not broad efficiency slogans.\n\n"
+
+            "DIFFERENTIATION TEST:\n"
+            "The revised JSON must sound like it was written for this specific opportunity and not for a random infrastructure tender.\n"
+            "If any line could be pasted into another tender with no one noticing, rewrite it.\n\n"
+
+            "DO NOT:\n"
+            "- Do not change the schema.\n"
+            "- Do not add commentary outside JSON.\n"
+            "- Do not remove useful project-specific detail.\n"
+            "- Do not make the language more generic in the name of polish.\n\n"
+
+            "FINAL INSTRUCTION:\n"
+            "Return the improved JSON only, with stronger differentiation, stronger engineering reasoning, stronger sequencing logic, and less template-like wording.\n\n"
+
+            "=== TENDER SUMMARY ===\n"
+            f"{summary_text}\n\n"
+
+            "=== KEY FACTS ===\n"
+            f"{facts_block}\n\n"
+
+            "=== CURRENT JSON TO IMPROVE ===\n"
+            f"{json.dumps(merged, ensure_ascii=False)}"
+        )
+
+        reviewed_text, _ = call_openai_text(
+            model,
+            review_prompt,
+            temperature=0.1,
+            max_output_tokens=7000,
+            timeout_read=480,
+        )
+
+        reviewed = parse_json_loose(reviewed_text)
+        if isinstance(reviewed, dict):
+            if isinstance(reviewed.get("title"), str) and reviewed.get("title", "").strip():
+                merged["title"] = reviewed["title"]
+
+            if isinstance(reviewed.get("context_objectives"), str) and reviewed.get("context_objectives", "").strip():
+                merged["context_objectives"] = reviewed["context_objectives"]
+
+            if isinstance(reviewed.get("methodology"), list) and reviewed["methodology"]:
+                merged["methodology"] = reviewed["methodology"]
+
+            if isinstance(reviewed.get("plan_table"), list):
+                merged["plan_table"] = reviewed["plan_table"]
+
+            if isinstance(reviewed.get("project_management"), dict):
+                merged["project_management"] = reviewed["project_management"]
+
+            if isinstance(reviewed.get("risk"), dict):
+                merged["risk"] = reviewed["risk"]
+
+            if isinstance(reviewed.get("quality"), dict):
+                merged["quality"] = reviewed["quality"]
+
+            if isinstance(reviewed.get("additional_services"), list):
+                merged["additional_services"] = reviewed["additional_services"]
+
+            if isinstance(reviewed.get("assumptions"), list):
+                merged["assumptions"] = reviewed["assumptions"]
+
+            if isinstance(reviewed.get("references"), list):
+                merged["references"] = reviewed["references"]
+
+            if isinstance(reviewed.get("deliverables_register"), list):
+                merged["deliverables_register"] = reviewed["deliverables_register"]
+
+            if isinstance(reviewed.get("document_control"), dict):
+                merged["document_control"] = reviewed["document_control"]
+
+            if isinstance(reviewed.get("stakeholder_engagement"), dict):
+                merged["stakeholder_engagement"] = reviewed["stakeholder_engagement"]
+
+            if isinstance(reviewed.get("procurement_logic"), dict):
+                merged["procurement_logic"] = reviewed["procurement_logic"]
+
+            if isinstance(reviewed.get("value_engineering"), list):
+                merged["value_engineering"] = reviewed["value_engineering"]
+        else:
+            print("[WARN] self-review returned non-dict JSON")
+
+    except Exception as e:
+        print("[WARN] self-review step failed:", e)
 
     return merged
 
@@ -1987,8 +2796,17 @@ def merge_pdfs():
                         if embedded:
                             out_parts.append(f"=== PAGE {i+1} (embedded) ===\n{embedded}\n")
 
+                final_text = _clean_ocr_text("\n\n".join(out_parts))
+
+                if len(final_text.strip()) < 1500:
+                    return jsonify({
+                        "message": "Very little embedded text was found. This document may actually be scanned. Please retry with OCR enabled.",
+                        "filename": filename,
+                        "ocr": {"status": "needs_ocr", "job_id": None}
+                    }), 400
+
                 with open(text_filepath, "w", encoding="utf-8") as f:
-                    f.write(_clean_ocr_text("\n\n".join(out_parts)))
+                    f.write(final_text)
 
             except Exception as e:
                 return jsonify({"message": f"Failed to extract embedded text: {e}"}), 500
@@ -2060,6 +2878,11 @@ def merge_pdfs():
             text = extract_text_from_file(merged_pdf_path)
         except Exception as e:
             return jsonify({"message": f"Failed to extract text: {str(e)}"}), 500
+
+        if len((text or "").strip()) < 1500:
+            return jsonify({
+                "message": "Very little embedded text was found in the merged PDF. One or more files may actually be scanned. Please retry with OCR enabled."
+            }), 400
 
         with open(merged_txt_path, "w", encoding="utf-8") as f:
             f.write(text or "")
@@ -2317,7 +3140,7 @@ def run_ocr_job(job_id: str, pdf_path: str, text_filepath: str, filename: str):
         OCR_JOBS[job_id]["message"] = f"OCR failed: {e}"
 
 
-def _ocr_pdf_background(job_id: str, pdf_path: str, text_filepath: str, ocr_dpi: int = 220):
+def _ocr_pdf_background(job_id: str, pdf_path: str, text_filepath: str, ocr_dpi: int = 240):
     try:
         with OCR_JOBS_LOCK:
             OCR_JOBS[job_id]["status"] = "running"
@@ -2341,30 +3164,68 @@ def _ocr_pdf_background(job_id: str, pdf_path: str, text_filepath: str, ocr_dpi:
                         return
 
                 page = doc.load_page(i)
+
+                # 1) Fast path: use embedded text if the page already has usable text
+                embedded = (page.get_text("text") or "").strip()
+                if _looks_like_real_text(embedded):
+                    with open(text_filepath, "a", encoding="utf-8") as f:
+                        f.write(f"\n\n=== PAGE {i+1} (embedded) ===\n")
+                        f.write(embedded + "\n")
+
+                    with OCR_JOBS_LOCK:
+                        OCR_JOBS[job_id]["done"] = i + 1
+                        OCR_JOBS[job_id]["page"] = i + 1
+                        OCR_JOBS[job_id]["last_conf"] = None
+                        OCR_JOBS[job_id]["message"] = f"Used embedded text for page {i+1}/{total}"
+                        try:
+                            OCR_JOBS[job_id]["chars"] = os.path.getsize(text_filepath)
+                        except Exception:
+                            pass
+
+                    print(f"[OCR] job={job_id} page {i+1}/{total} used embedded text")
+                    continue
+
+                # 2) Render image at lower DPI for speed
                 zoom = ocr_dpi / 72.0
                 mat = fitz.Matrix(zoom, zoom)
                 pix = page.get_pixmap(matrix=mat, alpha=False)
                 img = Image.open(io.BytesIO(pix.tobytes("png")))
 
-                candidates = []
-                for v in (0, 1):
-                    pre_v = preprocess_for_ocr_variant(img, v)
-                    t, c = ocr_page_best_effort(pre_v)
-                    score = c + min(len(t) / 2500.0, 1.0) * 10.0
-                    candidates.append((score, t, c, v))
+                # 3) First try the default preprocessing only
+                pre_v0 = preprocess_for_ocr_variant(img, 0)
+                txt, conf = ocr_page_best_effort(pre_v0)
 
-                # pick best
-                candidates.sort(key=lambda x: x[0], reverse=True)
-                _, txt, conf, best_v = candidates[0]
+                # 4) Only try fallback preprocessing if first pass looks weak
+                if len(txt or "") < 500 or conf < 85:
+                    candidates = [(txt, conf)]
+
+                    pre_v1 = preprocess_for_ocr_variant(img, 1)
+                    txt1, conf1 = ocr_page_best_effort(pre_v1)
+                    candidates.append((txt1, conf1))
+
+                    pre_v2 = preprocess_for_ocr_variant(img, 3)
+                    txt3, conf3 = ocr_page_best_effort(pre_v2)
+                    candidates.append((txt3, conf3))
+
+                    best_txt, best_conf = txt, conf
+                    best_score = conf + min(len(txt or "") / 2500.0, 1.0) * 10.0
+
+                    for cand_txt, cand_conf in candidates[1:]:
+                        cand_score = cand_conf + min(len(cand_txt or "") / 2500.0, 1.0) * 10.0
+                        if cand_score > best_score:
+                            best_txt, best_conf = cand_txt, cand_conf
+                            best_score = cand_score
+
+                    txt, conf = best_txt, best_conf
 
                 with open(text_filepath, "a", encoding="utf-8") as f:
-                    f.write(f"\n\n=== PAGE {i+1} ===\n")
+                    f.write(f"\n\n=== PAGE {i+1} (ocr) ===\n")
                     f.write((txt or "") + "\n")
 
                 with OCR_JOBS_LOCK:
                     OCR_JOBS[job_id]["done"] = i + 1
                     OCR_JOBS[job_id]["page"] = i + 1
-                    OCR_JOBS[job_id]["last_conf"] = float(conf)
+                    OCR_JOBS[job_id]["last_conf"] = float(conf) if conf is not None else None
                     OCR_JOBS[job_id]["message"] = f"OCR page {i+1}/{total}"
                     try:
                         OCR_JOBS[job_id]["chars"] = os.path.getsize(text_filepath)
@@ -2372,24 +3233,17 @@ def _ocr_pdf_background(job_id: str, pdf_path: str, text_filepath: str, ocr_dpi:
                         pass
 
                 print(f"[OCR] job={job_id} page {i+1}/{total} chars={len(txt or '')} conf={conf:.1f}")
-                time.sleep(0.05)
 
         with OCR_JOBS_LOCK:
             OCR_JOBS[job_id]["status"] = "done"
             OCR_JOBS[job_id]["message"] = "OCR complete"
             OCR_JOBS[job_id]["completed_at"] = datetime.utcnow().isoformat()
-            OCR_JOBS[job_id]["completed_at_ts"] = time.time()
-
-        _cleanup_old_ocr_jobs()
 
     except Exception as e:
         print("[OCR] Background OCR error:", e)
         with OCR_JOBS_LOCK:
             OCR_JOBS[job_id]["status"] = "error"
             OCR_JOBS[job_id]["message"] = str(e)
-            OCR_JOBS[job_id]["completed_at_ts"] = time.time()
-
-        _cleanup_old_ocr_jobs()
 
 def find_snippets(text: str, query: str, window: int = 800, max_hits: int = 3):
     if not text or not query:
@@ -2979,18 +3833,28 @@ def create_app():
 
 
 def build_methodology_prompt_ecsa_iso(extracted_text, extra_context=""):
-    context = (extracted_text or "")[:180000]
+    context = (extracted_text or "")[:220000]
     style_pack = build_style_and_fewshot()
 
-    style_guide = style_pack.get("style_guide", "")[:12000]
-    mapping = style_pack.get("example_mapping", {})
-    tender_snip = mapping.get("tender_snippet", "")[:4000]
-    output_snip = mapping.get("output_snippet", "")[:6000]
+    style_guide = (style_pack.get("style_guide", "") or "")[:5000]
 
     brief = (
         "You are a senior bid manager and project engineer.\n"
-        "Goal: Generate a personalised, non-regurgitated Methodology & Preliminary Project Plan tailored to THIS RFP.\n\n"
-        "STRICT STRUCTURE & RETURN FORMAT (VALID JSON ONLY):\n"
+        "Your task is to generate a tender-specific Methodology and Preliminary Project Plan.\n\n"
+
+        "CRITICAL RULES:\n"
+        "- The output must be specific to THIS tender.\n"
+        "- Do NOT write generic consulting filler.\n"
+        "- Do NOT merely restate the tender scope.\n"
+        "- Use the tender's actual context, scope, stakeholders, constraints, deliverables, and programme signals.\n"
+        "- Where the tender is incomplete, use careful engineering judgement.\n"
+        "- The methodology must explain HOW the work will be delivered.\n"
+        "- Use professional engineering language suitable for a South African consulting engineering submission.\n"
+        "- Align risk content to ISO 31000:2018.\n"
+        "- Align quality content to ISO 9001:2015.\n"
+        "- Keep tone professional and polished, but prioritise specificity over polish.\n\n"
+
+        "RETURN FORMAT: VALID JSON ONLY\n"
         "{\n"
         "  \"title\": string,\n"
         "  \"context_objectives\": string,\n"
@@ -3001,25 +3865,31 @@ def build_methodology_prompt_ecsa_iso(extracted_text, extra_context=""):
         "  \"quality\": {\"qa_plan\": string, \"controls\": string},\n"
         "  \"additional_services\": [string],\n"
         "  \"assumptions\": [string],\n"
-        "  \"references\": [string]\n"
+        "  \"references\": [string],\n"
+        "  \"deliverables_register\": [{\"deliverable\": string, \"ecsa_stage\": string, \"owner\": string, \"format\": string, \"acceptance_criteria\": string}],\n"
+        "  \"document_control\": {\"document_metadata\": string, \"review_approval\": string},\n"
+        "  \"stakeholder_engagement\": {\"approach\": string, \"channels\": [string]},\n"
+        "  \"procurement_logic\": {\"stage_gates\": [string], \"fee_repricing\": string},\n"
+        "  \"value_engineering\": [string]\n"
         "}\n\n"
-        "STYLE & LAYOUT: imitate the voice, density, headings, bullets, and flow from the STYLE GUIDE below.\n"
-        "Avoid copying wording; instead, emulate tone and structure.\n"
-        "ECSA, ISO 31000:2018, ISO 9001:2015 anchors must be explicit where relevant.\n"
+
+        "STYLE GUIDE:\n"
+        "- Use clear section-ready wording.\n"
+        "- Be structured and concise.\n"
+        "- Sound like a real engineering bid, not a generic AI answer.\n"
+        "- Use the style guide only for tone and professionalism, not for copying content.\n"
     )
+
     if extra_context:
-        brief += "\nAdditional preferences from user:\n" + extra_context
+        brief += "\nAdditional preferences from user:\n" + extra_context + "\n"
 
-    fewshot = (
-        "\n=== STYLE GUIDE (derived from our approved example DOCX) ===\n"
-        + style_guide +
-        "\n\n=== FEW-SHOT MAPPING (how tender text transforms to final prose) ===\n"
-        "SOURCE_TENDER_SNIPPET:\n" + tender_snip +
-        "\n\nEXPECTED_OUTPUT_STYLE_SNIPPET:\n" + output_snip + "\n"
+    return (
+        brief
+        + "\n=== LIGHT STYLE GUIDE ===\n"
+        + style_guide
+        + "\n\n=== THIS TENDER TEXT ===\n"
+        + context
     )
-
-    return f"{brief}\n\n=== THIS RFP (source extract) ===\n{context}\n{fewshot}"
-
 
 def _is_effectively_empty(value):
     if value is None:
@@ -3116,6 +3986,19 @@ def generate_methodology_plan():
 
     if not filename:
         return jsonify({"message": "Filename not provided."}), 400
+    
+    status, ocr_payload = _ocr_status_for_filename(filename)
+    if status in ("queued", "running"):
+        return jsonify({
+            "answer": "OCR still in progress. Please wait for it to finish, then ask again.",
+            "ocr": ocr_payload
+        }), 202
+        
+    if status == "error":
+        return jsonify({
+            "message": "OCR failed for this document. Please retry the upload or OCR process.",
+            "ocr": ocr_payload
+        }), 400
 
     text_path = os.path.join("temp_data", f"{filename}.txt")
     if not os.path.exists(text_path):
@@ -3123,6 +4006,15 @@ def generate_methodology_plan():
 
     with open(text_path, "r", encoding="utf-8") as f:
         extracted_text = f.read()
+
+    if not extracted_text.strip():
+        return jsonify({"message": "No extracted text was found in the document."}), 400
+
+    if len(extracted_text.strip()) < 3000:
+        return jsonify({
+            "message": "Extracted text is too limited to generate a reliable methodology. The document may be scanned and OCR may not have completed correctly."
+        }), 400
+
 
     model = os.getenv("OPENAI_MODEL", "gpt-5-pro")
 
